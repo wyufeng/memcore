@@ -169,6 +169,13 @@ def cmd_doctor(args, cfg, store) -> int:
     print(f"  home       : {cfg.home}")
     print(f"  db         : {cfg.db_path} ({'存在' if cfg.db_path.exists() else '待创建'})")
     print(f"  embedder   : {getattr(store.embedder, 'name', 'hash')}")
+    print(f"  embed prov : {cfg.embed_provider}")
+    print(f"  本地向量模型: {_local_model_status(cfg)}")
+    ex = cfg.effective_extract()
+    if ex["enabled"]:
+        print(f"  抽取模型   : {ex['model']} @ {ex['base_url']} (temp={ex['temperature']})")
+    else:
+        print("  抽取模型   : 未配置（走规则抽取）")
     print(f"  llm        : {'已配置 ' + cfg.llm_model if cfg.use_llm and cfg.llm_model else '未配置（走规则抽取）'}")
     try:
         import sqlite3
@@ -182,6 +189,127 @@ def cmd_doctor(args, cfg, store) -> int:
         print(f"  {host:<11}: {path or '未安装'}")
     st = store.stats()
     print(f"  memories   : {st['active']} 活跃 / {st['archived']} 归档")
+    return 0
+
+
+def _local_model_status(cfg) -> str:
+    """检查本地向量模型是否可用（不加载模型，只探路径与文件）。"""
+    try:
+        from .embed_local import describe_local_model
+        info = describe_local_model(cfg)
+    except Exception as exc:  # noqa: BLE001
+        return f"检测失败 ({exc})"
+    if not info.get("found"):
+        return f"未找到（将退回哈希向量）{info.get('hint', '')}"
+    return (
+        f"{info.get('name', 'local')} @ {info.get('path')} "
+        f"(dim={info.get('dim')}, size={info.get('size_mb')}MB)"
+    )
+
+
+# 允许通过 CLI 修改的配置项
+CONFIG_KEYS = {
+    "llm_base_url": str,
+    "llm_api_key": str,
+    "llm_model": str,
+    "use_llm": bool,
+    "extract_base_url": str,
+    "extract_api_key": str,
+    "extract_model": str,
+    "extract_temperature": float,
+    "extract_timeout": float,
+    "extract_max_items": int,
+    "extract_prompt_file": str,
+    "embed_provider": str,
+    "embed_model_path": str,
+    "embed_max_len": int,
+    "embed_query_prefix": str,
+    "embed_threads": int,
+    "embed_base_url": str,
+    "embed_api_key": str,
+    "embed_model": str,
+    "embed_dim": int,
+}
+
+
+def _cast_config_value(key: str, raw: str):
+    caster = CONFIG_KEYS[key]
+    if caster is bool:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    if caster is int:
+        return int(float(raw))
+    if caster is float:
+        return float(raw)
+    return raw
+
+
+def cmd_config(args, cfg, store) -> int:
+    action = getattr(args, "action", "show")
+    if action == "show":
+        d = cfg.to_dict()
+        keys = args.keys or sorted(CONFIG_KEYS.keys())
+        for k in keys:
+            if k in d:
+                print(f"{k} = {d[k]!r}")
+        print(f"# 配置文件: {cfg.config_path}")
+        return 0
+
+    if action == "set":
+        if not args.key:
+            print("error: 需要 key=value 参数", file=sys.stderr)
+            return 2
+        items = args.key if isinstance(args.key, list) else [args.key]
+        changed = {}
+        for item in items:
+            if "=" not in item:
+                print(f"error: 非法参数 {item!r}，应为 key=value", file=sys.stderr)
+                return 2
+            k, v = item.split("=", 1)
+            k = k.strip()
+            if k not in CONFIG_KEYS:
+                print(f"error: 未知配置项 {k!r}", file=sys.stderr)
+                return 2
+            try:
+                changed[k] = _cast_config_value(k, v)
+            except (TypeError, ValueError) as exc:
+                print(f"error: {k} 取值非法: {exc}", file=sys.stderr)
+                return 2
+        for k, v in changed.items():
+            setattr(cfg, k, v)
+        cfg.save()
+        for k, v in changed.items():
+            shown = "***" if k.endswith("api_key") and v else v
+            print(f"{k} = {shown!r}")
+        print(f"# 已保存到 {cfg.config_path}")
+        return 0
+
+    if action == "unset":
+        if not args.key:
+            print("error: 需要 key", file=sys.stderr)
+            return 2
+        for k in args.key:
+            if k not in CONFIG_KEYS:
+                print(f"error: 未知配置项 {k!r}", file=sys.stderr)
+                return 2
+            setattr(cfg, k, "" if CONFIG_KEYS[k] is str else CONFIG_KEYS[k](0))
+        cfg.save()
+        print(f"已清空 {args.key} -> {cfg.config_path}")
+        return 0
+
+    if action == "keys":
+        for k in sorted(CONFIG_KEYS.keys()):
+            print(k)
+        return 0
+
+    return 2
+
+
+def cmd_reembed(args, cfg, store) -> int:
+    """切换 embedding 提供方后重建全部向量。"""
+    res = store.reembed(include_archived=not args.active_only)
+    print(json.dumps(res, ensure_ascii=False))
+    if res["failed"]:
+        print(f"警告: {res['failed']} 条重建失败", file=sys.stderr)
     return 0
 
 
@@ -263,6 +391,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     o = sub.add_parser("doctor", help="环境自检")
     o.set_defaults(func=cmd_doctor)
+
+    rb = sub.add_parser("reembed", help="用当前向量模型重建全部向量")
+    rb.add_argument("--active-only", action="store_true", help="只处理未归档记忆")
+    rb.set_defaults(func=cmd_reembed)
+
+    cfgp = sub.add_parser("config", help="查看/修改配置")
+    cfgp.add_argument("action", nargs="?", default="show",
+                      choices=["show", "set", "unset", "keys"])
+    cfgp.add_argument("key", nargs="*", help="key=value（set）或 key（unset）")
+    cfgp.add_argument("--keys", nargs="*", default=None, help="show 时只显示这些键")
+    cfgp.set_defaults(func=cmd_config)
 
     m = sub.add_parser("mcp", help="启动 MCP stdio 服务")
     m.set_defaults(func=cmd_mcp)

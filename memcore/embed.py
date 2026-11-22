@@ -107,8 +107,48 @@ class RemoteEmbedder:
         return [self.embed(t) for t in texts]
 
 
-def get_embedder(cfg) -> "HashEmbedder | RemoteEmbedder":
-    """按配置选择 embedding 提供方，网关不可用时自动退回本地哈希向量。"""
+def get_embedder(cfg) -> "HashEmbedder | RemoteEmbedder | object":
+    """按配置选择 embedding 提供方。
+
+    provider:
+    - auto   : 有本地模型就用本地模型，否则退回哈希向量（默认）
+    - local  : 强制本地模型；模型缺失则退回哈希向量
+    - hash   : 只用内置哈希向量
+    - remote : 只用内网 OpenAI 兼容网关；不可用时退回哈希向量
+    """
+    provider = (getattr(cfg, "embed_provider", "auto") or "auto").lower()
+
+    if provider == "hash":
+        return HashEmbedder(dim=cfg.embed_dim)
+
+    if provider == "remote":
+        if cfg.embed_base_url and cfg.embed_model:
+            return RemoteEmbedder(
+                cfg.embed_base_url, cfg.embed_api_key, cfg.embed_model,
+                dim=cfg.embed_dim, timeout=cfg.llm_timeout,
+            )
+        return HashEmbedder(dim=cfg.embed_dim)
+
+    # auto / local：先试本地 ONNX 模型
+    try:
+        from .embed_local import try_local_embedder
+
+        local = try_local_embedder(cfg)
+        if local is not None:
+            return local
+    except Exception:
+        pass
+
+    if provider == "local":
+        # 明确要求 local 但不可用：退回远程网关（若配置了），否则哈希
+        if cfg.embed_base_url and cfg.embed_model:
+            return RemoteEmbedder(
+                cfg.embed_base_url, cfg.embed_api_key, cfg.embed_model,
+                dim=cfg.embed_dim, timeout=cfg.llm_timeout,
+            )
+        return HashEmbedder(dim=cfg.embed_dim)
+
+    # auto：本地模型不可用时才考虑内网网关
     if cfg.embed_base_url and cfg.embed_model:
         return RemoteEmbedder(
             cfg.embed_base_url, cfg.embed_api_key, cfg.embed_model,

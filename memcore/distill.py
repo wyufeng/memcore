@@ -106,6 +106,77 @@ _LLM_PROMPT = """你是长期记忆抽取器。从下面的对话中提取值得
 """
 
 
+def _is_ollama_url(url: str) -> bool:
+    """判断地址是否为 Ollama 原生接口。
+
+    识别方式：
+    - 路径含 /api（/api、/api/chat）
+    - 端口为 11434（Ollama 默认端口）
+    """
+    if not url:
+        return False
+    low = url.lower()
+    if "/api" in low:
+        return True
+    m = re.search(r":(\d{2,5})(?:/|$)", low)
+    if m and m.group(1) == "11434":
+        return True
+    return False
+
+
+def _build_chat_request(
+    base_url: str,
+    model: str,
+    text: str,
+    temperature: float,
+    prompt: Optional[str] = None,
+) -> tuple:
+    """构造抽取请求。
+
+    返回 (url, payload)。兼容三类本地部署：
+    - OpenAI 兼容（/v1/chat/completions）
+    - Ollama 原生（/api/chat）
+    - 无后缀裸地址（自动补 /v1）
+
+    prompt 若含 {text} 占位符，会在此处替换为原文。
+    """
+    url = base_url.rstrip("/")
+    if prompt:
+        system_prompt = prompt.replace("{text}", text[:20000])
+    else:
+        system_prompt = _LLM_PROMPT % text[:20000]
+
+    if _is_ollama_url(url):
+        if url.endswith("/api/chat"):
+            ollama_url = url
+        elif url.endswith("/api"):
+            ollama_url = url + "/chat"
+        else:
+            ollama_url = url + "/api/chat"
+        return ollama_url, {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "你只输出 JSON，不做解释。"},
+                {"role": "user", "content": system_prompt},
+            ],
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+
+    if not url.endswith("/v1") and not url.endswith("/chat/completions"):
+        url = url + "/v1"
+    if not url.endswith("/chat/completions"):
+        url = url + "/chat/completions"
+    return url, {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "你只输出 JSON，不做解释。"},
+            {"role": "user", "content": system_prompt},
+        ],
+        "temperature": temperature,
+    }
+
+
 def llm_extract(
     text: str,
     base_url: str,
@@ -113,20 +184,21 @@ def llm_extract(
     model: str,
     timeout: float = 60.0,
     max_items: int = 12,
+    temperature: float = 0.1,
+    prompt: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """调用内网 OpenAI 兼容网关做抽取；失败则返回空列表。"""
+    """调用内网 OpenAI 兼容网关做抽取；失败则返回空列表。
+
+    base_url 支持：
+    - http://host:port/v1        （OpenAI 兼容网关，如 vLLM / Xinference）
+    - http://host:port           （自动补 /v1）
+    - http://host:port/api       （Ollama 原生接口，自动转 /api/chat）
+    """
     if not (base_url and model):
         return []
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "你只输出 JSON，不做解释。"},
-            {"role": "user", "content": _LLM_PROMPT % text[:20000]},
-        ],
-        "temperature": 0.1,
-    }
+    endpoint, payload = _build_chat_request(base_url, model, text, temperature, prompt)
     req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/chat/completions",
+        endpoint,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
@@ -137,7 +209,11 @@ def llm_extract(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        content = data["choices"][0]["message"]["content"]
+        if "choices" in data:
+            content = data["choices"][0]["message"]["content"]
+        else:
+            # Ollama 原生返回：message.content
+            content = data["message"]["content"]
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError):
         return []
 
@@ -184,15 +260,65 @@ def llm_extract(
     return out
 
 
+def _load_prompt(cfg) -> str:
+    """读取自定义抽取提示词文件（支持 {text} 占位）。"""
+    path = ""
+    try:
+        path = (getattr(cfg, "extract_prompt_file", "") or "").strip()
+    except Exception:
+        path = ""
+    if not path:
+        return ""
+    try:
+        from pathlib import Path
+
+        return Path(path).expanduser().read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
 def distill(
     text: str,
     cfg,
-    max_items: int = 12,
+    max_items: int = 0,
 ) -> List[Dict[str, Any]]:
-    """组合抽取：优先 LLM，失败或未配置时用规则。"""
-    if cfg.use_llm and cfg.llm_base_url and cfg.llm_model:
-        items = llm_extract(text, cfg.llm_base_url, cfg.llm_api_key,
-                            cfg.llm_model, cfg.llm_timeout, max_items)
+    """组合抽取：优先配置的抽取模型，失败或未配置时用规则。"""
+    try:
+        eff = cfg.effective_extract()
+    except Exception:
+        eff = {
+            "base_url": getattr(cfg, "llm_base_url", ""),
+            "api_key": getattr(cfg, "llm_api_key", ""),
+            "model": getattr(cfg, "llm_model", ""),
+            "temperature": 0.1,
+            "timeout": getattr(cfg, "llm_timeout", 60.0),
+            "max_items": 12,
+            "prompt_file": "",
+            "enabled": False,
+        }
+
+    limit = int(max_items or eff.get("max_items") or 12)
+    if eff.get("enabled"):
+        prompt = ""
+        pfile = eff.get("prompt_file")
+        if pfile:
+            try:
+                from pathlib import Path
+
+                raw = Path(pfile).expanduser().read_text(encoding="utf-8")
+                prompt = raw.replace("{text}", text[:20000])
+            except Exception:
+                prompt = ""
+        items = llm_extract(
+            text,
+            eff["base_url"],
+            eff["api_key"],
+            eff["model"],
+            eff.get("timeout", 60.0),
+            limit,
+            temperature=eff.get("temperature", 0.1),
+            prompt=prompt or None,
+        )
         if items:
             return items
-    return rule_extract(text, max_items)
+    return rule_extract(text, limit)

@@ -175,17 +175,105 @@ CLI 侧同理，返回退出码 2 而不是抛栈。
 
 ---
 
+## 13. 目标机不能联网：第三方依赖必须随仓库分发
+
+**症状**：在开发机上 `pip install numpy onnxruntime` 好好的，拷到内网机器上就装不上——
+没有 PyPI 源，也没法 sudo。
+
+**原因**：Python 生态的二进制依赖（numpy / onnxruntime）默认都从 PyPI 拉，
+内网机器既没源也没有编译工具链。
+
+**解法**：在开发机把 wheel 下好放进 `vendor/wheels/`，连同模型文件一起提交进 git，
+目标机 `git clone` 后用 `pip install --no-index --find-links vendor/wheels` 离线安装。
+
+```
+vendor/wheels/numpy-1.26.4-cp39-cp310-cp311-cp312-manylinux_2_17_x86_64.whl
+vendor/wheels/onnxruntime-1.16.3-cp39-cp310-cp311-...whl
+vendor/wheels/onnxruntime-1.19.2-cp312-...whl
+```
+
+wheel 要覆盖多个 Python 版本（cp39/cp310/cp311/cp312），
+因为目标机 Python 版本不确定。onnxruntime 1.19 才有 cp312 的 wheel，
+1.16.3 最高到 cp311 —— 所以两个版本都要备。
+
+**另外**：pip 可能压根不存在（精简镜像常见），安装器要有手动解压 wheel 的兜底路径。
+
+---
+
+## 14. HuggingFace 直连被拦，模型下不下来
+
+**症状**：`urlopen error Tunnel connection failed: 502 Bad Gateway`，访问 `huggingface.co`。
+
+**原因**：内网出口只放行了部分域名，HF 直连走不通。
+
+**解法**：走镜像 `https://hf-mirror.com`。但**必须伪装 User-Agent**，
+否则下载小文件会 403：
+
+```python
+req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+```
+
+模型源用 `Xenova/bge-small-zh-v1.5`（ONNX 导出版，带 `onnx/model_int8.onnx`），
+比官方仓库的 pytorch_model.bin 轻得多。
+
+---
+
+## 15. 不要为分词引入 transformers / tokenizers
+
+**症状**：为了跑本地 embedding 模型，很自然地想到 `pip install transformers`，
+然后发现它要拖 torch（几百 MB）、`tokenizers`（Rust 扩展，还要编译）。
+
+**原因**：transformers 的价值在通用性，但我们只需要标准 BERT WordPiece 的一种实现。
+
+**解法**：自己写纯标准库 BertTokenizer（BasicTokenizer + WordPiece），
+`memcore/tokenizer.py` 不到 200 行。这样整个向量化链路只剩两个二进制依赖：
+numpy + onnxruntime。
+
+关键细节：
+- WordPiece 贪心最长匹配，续接片段加 `##` 前缀
+- 中文按单字切分（`_tokenize_chinese_chars`）
+- 未命中整词退 `[UNK]`
+- `do_lower_case` 从 `tokenizer_config.json` 读
+
+---
+
+## 16. 切换向量模型后必须重建旧向量
+
+**症状**：装上本地模型后，`doctor` 显示 embedder 是 `local-onnx`，
+但召回质量还是老样子，语义检索几乎不生效。
+
+**原因**：旧记忆的向量是 256 维哈希向量，新模型是 512 维。
+检索时维度不匹配的向量会被**静默跳过**（`if dim != len(qvec): continue`），
+不报错也不提示。
+
+**解法**：提供 `memcore reembed` 命令，用当前 embedder 重建全部向量。
+切换 provider 或换模型后必须跑一次。
+
+```bash
+memcore config set embed_provider=local
+memcore reembed
+```
+
+---
+
 ## 附：真机验证清单
 
 在 Linux 目标机上跑完这几项才算真的可用：
 
 ```bash
 python3 -m unittest discover -s tests        # 单元测试
-sh scripts/install.sh                        # 安装
-memcore doctor                               # 环境自检
+sh scripts/install.sh                        # 安装（全程离线）
+memcore doctor                               # 环境自检（应显示本地向量模型就绪）
+python3 -c "import numpy, onnxruntime; print('ok')"   # 二进制依赖可用
 memcore remember "示例" --kind pref          # 写入
 memcore recall "示例"                        # 检索
 opencode mcp list                            # MCP 是否 connected
 python3 -m memcore.hooks session_start       # hooks 注入（stdin 传 JSON）
 node /tmp/plugtest.mjs                       # 插件注入是否进 system prompt
+```
+
+验证"真的没联网"（断网或防火墙下执行）：
+
+```bash
+pip install --no-index --find-links vendor/wheels numpy onnxruntime   # 应成功
 ```

@@ -1,12 +1,13 @@
 #!/bin/sh
-# memcore 一键安装脚本（Linux / macOS，免 sudo）
+# memcore 一键安装脚本（Linux / macOS，免 sudo，全程离线）
 #
-#   curl -fsSL https://raw.githubusercontent.com/<owner>/memcore/main/scripts/install.sh | sh
-#   或本地： sh scripts/install.sh
+#   git clone https://github.com/wyufeng/memcore.git
+#   cd memcore && sh scripts/install.sh
 #
 # 特性：
 # - 只写用户目录（~/.local、~/.config），不需要 root
-# - 零 pip / npm 依赖，纯 Python 标准库
+# - 零联网：numpy / onnxruntime 从 vendor/wheels 离线安装，本地模型从 vendor/models 复制
+# - 本地向量模型不可用时自动退回内置哈希向量，功能不中断
 # - 自动探测 Python3（>=3.8）与 SQLite FTS5
 # - 可选一键写入 Claude Code / opencode 接入配置
 
@@ -16,6 +17,7 @@ PREFIX="${MEMCORE_PREFIX:-$HOME/.local}"
 REPO_DIR="${MEMCORE_REPO_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}"
 BIN_DIR="$PREFIX/bin"
 LIB_DIR="$PREFIX/lib/memcore"
+MODEL_DIR="$HOME/.local/share/memcore/models"
 
 log()  { printf '\033[36m[memcore]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[memcore]\033[0m %s\n' "$*" >&2; }
@@ -47,7 +49,98 @@ except Exception as exc:
 PYEOF
 log "SQLite FTS5: 可用"
 
-# ---------- 2. 安装 ----------
+PY_TAG="$("$PY" -c 'import sys; t=sys.implementation; print("cp%d%d" % sys.version_info[:2])')"
+
+# ---------- 2. 离线安装二进制依赖（numpy / onnxruntime） ----------
+#
+# 目标机不允许联网，依赖全部来自仓库内 vendor/wheels。
+# 优先用 pip --no-index；pip 不可用或失败时，回退到手动解压 wheel 到用户 site-packages。
+
+SITE_DIR="$("$PY" -c 'import site,sys; d=site.getusersitepackages(); print(d)' 2>/dev/null || true)"
+[ -n "$SITE_DIR" ] || SITE_DIR="$HOME/.local/lib/python3/site-packages"
+
+install_wheels() {
+    WHEEL_DIR="$REPO_DIR/vendor/wheels"
+    [ -d "$WHEEL_DIR" ] || { warn "vendor/wheels 不存在，跳过二进制依赖安装"; return 0; }
+
+    # 只挑与当前 Python 版本匹配的 wheel
+    SEL=$(ls "$WHEEL_DIR" 2>/dev/null | grep -- "-$PY_TAG-" || true)
+    if [ -z "$SEL" ]; then
+        warn "vendor/wheels 中没有匹配 $PY_TAG 的 wheel，跳过二进制依赖安装"
+        return 0
+    fi
+
+    # numpy 是 onnxruntime 的硬依赖，先装 numpy
+    for pkg in numpy onnxruntime; do
+        CASE_SEL=$(echo "$SEL" | grep -i "^$pkg-" || true)
+        [ -n "$CASE_SEL" ] || { warn "未找到 $pkg wheel，跳过"; continue; }
+        FILE=$(echo "$CASE_SEL" | head -1)
+        SRC="$WHEEL_DIR/$FILE"
+
+        if "$PY" -m pip --version >/dev/null 2>&1; then
+            if "$PY" -m pip install --no-index --find-links "$WHEEL_DIR" \
+                   --target "$SITE_DIR" --upgrade "$pkg" >/dev/null 2>&1; then
+                log "已离线安装 $pkg（pip --no-index）"
+                continue
+            fi
+            warn "pip 离线安装 $pkg 失败，改为手动解压"
+        else
+            warn "未找到 pip，改为手动解压 $pkg"
+        fi
+
+        # 手动解压 wheel（zip 结构，.data/ 里的内容也要处理）
+        TMP=$(mktemp -d)
+        if "$PY" - "$SRC" "$TMP" <<'PYEOF'
+import os, sys, zipfile
+wheel, dest = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(wheel) as z:
+    z.extractall(dest)
+# wheel 里 <pkg>-<ver>.data/ 下的内容并入目标
+data = None
+for d in os.listdir(dest):
+    if d.endswith(".data"):
+        data = os.path.join(dest, d)
+        break
+if data:
+    for sub in os.listdir(data):
+        src = os.path.join(data, sub)
+        if os.path.isdir(src):
+            for item in os.listdir(src):
+                s = os.path.join(src, item)
+                t = os.path.join(dest, item)
+                if os.path.isdir(s):
+                    os.makedirs(t, exist_ok=True)
+                    for f in os.listdir(s):
+                        shutil_move = os.path.join(s, f)
+                        with open(shutil_move, "rb") as fi, open(os.path.join(t, f), "wb") as fo:
+                            fo.write(fi.read())
+                else:
+                    with open(s, "rb") as fi, open(t, "wb") as fo:
+                        fo.write(fi.read())
+print("ok")
+PYEOF
+        then
+            mkdir -p "$SITE_DIR"
+            cp -R "$TMP"/* "$SITE_DIR"/ 2>/dev/null || true
+            rm -rf "$TMP"
+            log "已离线安装 $pkg（手动解压）"
+        else
+            rm -rf "$TMP"
+            warn "$pkg 手动解压失败"
+        fi
+    done
+
+    # 验证 numpy / onnxruntime 能否导入
+    if PYTHONPATH="$SITE_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY" -c 'import numpy, onnxruntime' 2>/dev/null; then
+        log "numpy + onnxruntime: 可用（本地向量模型就绪）"
+    else
+        warn "numpy / onnxruntime 不可用，向量化将退回内置哈希向量"
+    fi
+}
+
+install_wheels
+
+# ---------- 3. 安装主程序 ----------
 
 mkdir -p "$LIB_DIR" "$BIN_DIR"
 rm -rf "$LIB_DIR/memcore"
@@ -55,13 +148,29 @@ cp -R "$REPO_DIR/memcore" "$LIB_DIR/memcore"
 find "$LIB_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 find "$LIB_DIR" -name '*.pyc' -delete 2>/dev/null || true
 
+# ---------- 4. 复制本地向量模型 ----------
+
+if [ -d "$REPO_DIR/vendor/models" ]; then
+    mkdir -p "$MODEL_DIR"
+    # rsync 不可用时退化为 cp
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a "$REPO_DIR/vendor/models/" "$MODEL_DIR/"
+    else
+        cp -R "$REPO_DIR/vendor/models/." "$MODEL_DIR/"
+    fi
+    log "本地向量模型: $MODEL_DIR"
+else
+    warn "vendor/models 不存在，本地向量化不可用（将退回哈希向量）"
+fi
+
 cat > "$BIN_DIR/memcore" <<EOF
 #!/bin/sh
 # memcore launcher (generated by install.sh)
 MEMCORE_HOME="\${MEMCORE_HOME:-\$HOME/.local/share/memcore}"
 MEMCORE_DB_PATH="\${MEMCORE_DB_PATH:-\$MEMCORE_HOME/memories.db}"
-export MEMCORE_HOME MEMCORE_DB_PATH
-PYTHONPATH="$LIB_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
+MEMCORE_EMBED_MODEL_PATH="\${MEMCORE_EMBED_MODEL_PATH:-\$HOME/.local/share/memcore/models/bge-small-zh-v1.5}"
+export MEMCORE_HOME MEMCORE_DB_PATH MEMCORE_EMBED_MODEL_PATH
+PYTHONPATH="$SITE_DIR:$LIB_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
 export PYTHONPATH
 exec "$PY" -m memcore "\$@"
 EOF
@@ -70,7 +179,7 @@ chmod +x "$BIN_DIR/memcore"
 log "已安装: $LIB_DIR/memcore"
 log "已生成: $BIN_DIR/memcore"
 
-# ---------- 3. PATH 提示 ----------
+# ---------- 5. PATH 提示 ----------
 
 SHELL_RC=""
 for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
@@ -85,7 +194,7 @@ else
     log "PATH 已包含 $BIN_DIR"
 fi
 
-# ---------- 4. 宿主接入 ----------
+# ---------- 6. 宿主接入 ----------
 
 case "${MEMCORE_SKIP_HOST:-0}" in
     1) log "跳过宿主配置（MEMCORE_SKIP_HOST=1）" ;;
@@ -107,7 +216,7 @@ case "${MEMCORE_SKIP_HOST:-0}" in
         ;;
 esac
 
-# ---------- 5. 自检 ----------
+# ---------- 7. 自检 ----------
 
 "$BIN_DIR/memcore" doctor
 
@@ -118,6 +227,13 @@ cat <<EOF
 快速验证：
   $BIN_DIR/memcore remember "示例：用户偏好使用中文回答" --kind pref
   $BIN_DIR/memcore recall "语言偏好"
+
+配置抽取模型（内网 OpenAI 兼容 / Ollama / llama.cpp 均可）：
+  $BIN_DIR/memcore config set extract_base_url=http://10.0.0.10:11434/v1 \\
+      extract_model=qwen2.5:7b use_llm=true
+  $BIN_DIR/memcore config set extract_base_url=http://10.0.0.10:8000 \\
+      extract_model=qwen2.5-7b-instruct use_llm=true     # llama.cpp server
+  # 密钥不落明文，可用环境变量 MEMCORE_EXTRACT_API_KEY
 
 接入说明见 README「宿主接入」一节。
 EOF

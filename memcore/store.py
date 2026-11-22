@@ -241,6 +241,39 @@ class MemoryStore:
             sql += " WHERE archived=0"
         return int(self.con.execute(sql).fetchone()["c"])
 
+    def reembed(self, include_archived: bool = True, batch: int = 200) -> Dict[str, Any]:
+        """用当前 embedder 重建所有记忆的向量。
+
+        切换 embedding 提供方（如 hash 256 维 → 本地模型 512 维）后必须执行，
+        否则新旧向量维度不一致，检索时向量部分会被跳过。
+        """
+        provider = getattr(self.embedder, "name", "hash")
+        sql = "SELECT id, content FROM memories"
+        if not include_archived:
+            sql += " WHERE archived=0"
+        sql += " ORDER BY id"
+        rows = self.con.execute(sql).fetchall()
+        ok = 0
+        failed = 0
+        dims = set()
+        for r in rows:
+            try:
+                vec = self.embedder.embed(r["content"] or "")
+                dims.add(len(vec))
+                self.con.execute(
+                    "INSERT INTO vectors(mem_id,dim,vec,provider,updated_at) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(mem_id) DO UPDATE SET dim=excluded.dim,"
+                    " vec=excluded.vec, provider=excluded.provider,"
+                    " updated_at=excluded.updated_at",
+                    (r["id"], len(vec), embedmod.pack_vector(vec), provider, dbmod.now()),
+                )
+                ok += 1
+            except Exception:
+                failed += 1
+        self.con.commit()
+        return {"total": len(rows), "updated": ok, "failed": failed,
+                "provider": provider, "dims": sorted(dims)}
+
     # ---------- 生命周期 ----------
 
     def strength(self, mem: Dict[str, Any], halflife_days: float) -> float:

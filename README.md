@@ -2,9 +2,10 @@
 
 **内网离线、免 sudo 的长记忆内核**，为 Claude Code / opencode 这类 CLI Agent 提供跨会话记忆。
 
-- 零第三方依赖：只用 Python 标准库（sqlite3 + FTS5 + urllib），不需要 pip install、不需要 npm install
+- **完全离线自包含**：git clone 即可用。第三方 wheel 与本地向量模型全部随仓库提供，安装过程不联网
 - 不需要 root：全部写入用户目录 `~/.local`、`~/.config`、`~/.local/share`
-- 离线可用：默认用本地哈希向量 + 规则抽取，不依赖任何外部服务；可选接内网 LLM / embedding 网关增强
+- 本地向量化：内置 bge-small-zh-v1.5（int8 ONNX，纯 Python 分词），不依赖任何公网 API
+- 抽取模型可配置：内网 OpenAI 兼容网关 / Ollama / llama.cpp 都行，配不配置都能用
 - 双宿主接入：Claude Code（hooks + MCP）与 opencode（插件 + MCP）
 
 ---
@@ -25,10 +26,18 @@ memcore 把这些沉淀成一个可检索的记忆库，在会话开始/提问�
         ├──────────────────────┤
         │  retrieve (混合检索)  │  FTS5 BM25  ⊕  向量余弦  ⊕  重要度/时效/使用度
         ├──────────────────────┤
-        │  distill (记忆抽取)   │  规则抽取 ⊕ 可选内网 LLM
+        │  distill (记忆抽取)   │  规则抽取 ⊕ 可配置抽取模型（内网 LLM）
         ├──────────────────────┤
         │  store  (记忆仓库)    │  精确/近似去重合并、衰减归档、置顶
         └──────────────────────┘
+                  │
+      ┌───────────┴────────────┐
+      ▼                        ▼
+  本地向量模型              内网抽取模型
+  bge-small-zh-v1.5        OpenAI兼容/Ollama/
+  ONNX int8 / 512维        llama.cpp（可配）
+      │                        │
+      └────── 不可用自动降级 ─────┘
                   │
              SQLite (WAL)
         memories / memories_fts / vectors / sessions / episodes / links
@@ -52,15 +61,9 @@ memcore 把这些沉淀成一个可检索的记忆库，在会话开始/提问�
 
 ---
 
-## 安装（Linux，免 sudo）
+## 安装（Linux，免 sudo，全程离线）
 
-### 方式一：一键脚本
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/wyufeng/memcore/main/scripts/install.sh | sh
-```
-
-### 方式二：克隆后安装
+### 方式一：克隆后安装（推荐）
 
 ```bash
 git clone https://github.com/wyufeng/memcore.git
@@ -68,7 +71,10 @@ cd memcore
 sh scripts/install.sh
 ```
 
-### 方式三：直接拷贝（无 git 环境）
+**整个过程不联网。** numpy / onnxruntime 从仓库里的 `vendor/wheels` 离线安装，
+本地向量模型从 `vendor/models` 复制到 `~/.local/share/memcore/models`。
+
+### 方式二：直接拷贝（无 git 环境）
 
 ```bash
 cp -r memcore ~/.local/lib/memcore
@@ -77,7 +83,8 @@ cat > ~/.local/bin/memcore <<'EOF'
 #!/bin/sh
 MEMCORE_HOME="${MEMCORE_HOME:-$HOME/.local/share/memcore}"
 MEMCORE_DB_PATH="${MEMCORE_DB_PATH:-$MEMCORE_HOME/memories.db}"
-export MEMCORE_HOME MEMCORE_DB_PATH
+MEMCORE_EMBED_MODEL_PATH="${MEMCORE_EMBED_MODEL_PATH:-$HOME/.local/share/memcore/models/bge-small-zh-v1.5}"
+export MEMCORE_HOME MEMCORE_DB_PATH MEMCORE_EMBED_MODEL_PATH
 PYTHONPATH="$HOME/.local/lib/memcore${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
 exec python3 -m memcore "$@"
@@ -85,13 +92,17 @@ EOF
 chmod +x ~/.local/bin/memcore
 ```
 
+（这种方式不含本地模型，会退回内置哈希向量。想要语义检索请用方式一。）
+
 安装器会：
 
 1. 探测 `python3`（≥3.8）与 SQLite FTS5，不满足直接报错退出
-2. 拷贝包到 `~/.local/lib/memcore`，生成 `~/.local/bin/memcore` 启动脚本
-3. 把 `~/.local/bin` 写进 `~/.bashrc`（或 `.zshrc`/`.profile`）
-4. 检测到 `claude` / `opencode` 时自动写入接入配置
-5. 跑一次 `memcore doctor` 自检
+2. 从 `vendor/wheels` 离线安装 numpy / onnxruntime（pip `--no-index`，pip 不可用时自动改为手动解压 wheel）
+3. 拷贝包到 `~/.local/lib/memcore`，生成 `~/.local/bin/memcore` 启动脚本
+4. 把 `vendor/models` 复制到 `~/.local/share/memcore/models`
+5. 把 `~/.local/bin` 写进 `~/.bashrc`（或 `.zshrc`/`.profile`）
+6. 检测到 `claude` / `opencode` 时自动写入接入配置
+7. 跑一次 `memcore doctor` 自检
 
 卸载：`sh scripts/uninstall.sh`（加 `--purge` 连数据一起删）
 
@@ -100,6 +111,30 @@ chmod +x ~/.local/bin/memcore
 - Linux x86_64 / macOS，Python 3.8+
 - SQLite 需带 FTS5（CPython 官方发行版默认都有）
 - 不需要 Node —— Node 只在你想跑 opencode 时才需要
+- 磁盘约 140 MB（wheel + 模型）
+
+### vendor 目录说明
+
+仓库自带以下内容，保证目标机零下载：
+
+```
+vendor/
+├── wheels/                        # 二进制依赖（manylinux x86_64）
+│   ├── numpy-1.26.4-cp{39,310,311,312}-manylinux_2_17_x86_64.whl
+│   └── onnxruntime-1.16.3-cp{39,310,311} / 1.19.2-cp312-*.whl
+└── models/
+    └── bge-small-zh-v1.5/         # 本地向量模型（int8 ONNX，23.9 MB）
+        ├── config.json
+        ├── tokenizer_config.json
+        ├── special_tokens_map.json
+        ├── vocab.txt
+        └── onnx/model_int8.onnx
+```
+
+wheel 按 Python 版本自动匹配（cp39 / cp310 / cp311 / cp312 都有）。
+
+> 想换更大的向量模型（如 bge-base-zh-v1.5）？把模型目录放进 `vendor/models/`，
+> 然后 `memcore config set embed_model_path=<绝对路径>`，再 `memcore reembed` 重建向量。
 
 ---
 
@@ -121,7 +156,13 @@ memcore forget <id>                      # 软删除（归档）
 memcore forget <id> --hard               # 物理删除
 memcore stats
 memcore decay                            # 按衰减强度归档冷记忆
+memcore reembed                          # 切换向量模型后重建全部向量
 memcore doctor                           # 环境自检
+
+memcore config show                      # 查看全部配置
+memcore config keys                      # 列出可配置项
+memcore config set extract_base_url=http://10.0.0.10:8000/v1 extract_model=qwen2.5-7b use_llm=true
+memcore config unset extract_api_key
 ```
 
 ### MCP 工具
@@ -199,8 +240,19 @@ opencode mcp list
 | `MEMCORE_LLM_API_KEY` | 空 | 网关密钥 |
 | `MEMCORE_LLM_MODEL` | 空 | 模型名 |
 | `MEMCORE_USE_LLM` | `false` | 开启后优先用 LLM 抽取 |
-| `MEMCORE_EMBED_BASE_URL` | 空 | 内网 embedding 网关 |
-| `MEMCORE_EMBED_MODEL` | 空 | embedding 模型名 |
+| `MEMCORE_EXTRACT_BASE_URL` | 空 | **抽取模型地址**（独立配置，优先于 `LLM_BASE_URL`） |
+| `MEMCORE_EXTRACT_API_KEY` | 空 | 抽取模型密钥（不写入明文配置文件） |
+| `MEMCORE_EXTRACT_MODEL` | 空 | **抽取模型名** |
+| `MEMCORE_EXTRACT_TEMPERATURE` | `0.1` | 抽取温度（越低越稳定） |
+| `MEMCORE_EXTRACT_TIMEOUT` | `60` | 抽取超时（秒） |
+| `MEMCORE_EXTRACT_MAX_ITEMS` | `12` | 单次抽取最多产出几条 |
+| `MEMCORE_EXTRACT_PROMPT_FILE` | 空 | 自定义抽取提示词文件（支持 `{text}` 占位） |
+| `MEMCORE_EMBED_PROVIDER` | `auto` | 向量提供方：`auto`/`local`/`hash`/`remote` |
+| `MEMCORE_EMBED_MODEL_PATH` | 自动探测 | 本地向量模型目录 |
+| `MEMCORE_EMBED_MAX_LEN` | `256` | 分词最大长度 |
+| `MEMCORE_EMBED_THREADS` | `2` | ONNX 推理线程数 |
+| `MEMCORE_EMBED_BASE_URL` | 空 | 内网 embedding 网关（备用） |
+| `MEMCORE_EMBED_MODEL` | 空 | embedding 模型名（备用） |
 | `MEMCORE_RECALL_LIMIT` | `8` | 默认召回条数 |
 | `MEMCORE_W_LEXICAL` | `1.0` | 词法分权重 |
 | `MEMCORE_W_VECTOR` | `0.8` | 语义分权重 |
@@ -211,16 +263,49 @@ opencode mcp list
 > 环境变量一律要求 `MEMCORE_` 前缀。裸 `DB_PATH` 这类通用名会被忽略，
 > 避免和系统自带的环境变量撞车（踩过坑：`DB_PATH=.` 会让数据库路径变成当前目录）。
 
-### 接内网 LLM 网关（可选）
+### 配置抽取模型（可选）
+
+抽取模型是**独立配置**的，和向量模型互不影响。没配也能用（走内置规则抽取），
+配了就用你指定的模型做高质量抽取。
+
+三种部署形态都支持，写个地址就行：
 
 ```bash
-export MEMCORE_LLM_BASE_URL="http://内网网关/v1"
-export MEMCORE_LLM_API_KEY="sk-xxx"
-export MEMCORE_LLM_MODEL="qwen2.5-14b-instruct"
-export MEMCORE_USE_LLM=1
+# 1) OpenAI 兼容网关（vLLM / Xinference / OneAPI / 各家内网网关）
+memcore config set extract_base_url=http://10.0.0.10:8000/v1 \
+               extract_model=qwen2.5-14b-instruct use_llm=true
+
+# 2) Ollama 原生接口（自动识别 11434 端口或 /api 路径）
+memcore config set extract_base_url=http://10.0.0.10:11434 \
+               extract_model=qwen2.5:7b use_llm=true
+
+# 3) llama.cpp server
+memcore config set extract_base_url=http://10.0.0.10:8080 \
+               extract_model=qwen2.5-7b-instruct use_llm=true
 ```
 
-网关不可用时自动退回本地规则抽取，不会中断使用。
+地址规则：
+
+| 写法 | 实际请求地址 |
+|---|---|
+| `http://host:8000/v1` | `http://host:8000/v1/chat/completions` |
+| `http://host:8000` | `http://host:8000/v1/chat/completions`（自动补 `/v1`） |
+| `http://host:11434` | `http://host:11434/api/chat`（Ollama 原生） |
+| `http://host:11434/api` | `http://host:11434/api/chat` |
+
+密钥**不会写进明文配置文件**，用环境变量传：
+
+```bash
+export MEMCORE_EXTRACT_API_KEY="sk-xxx"
+```
+
+抽取模型不可用时自动退回本地规则抽取，不会中断使用。
+
+自定义提示词（可选，支持 `{text}` 占位）：
+
+```bash
+memcore config set extract_prompt_file=/etc/memcore/extract_prompt.txt
+```
 
 ---
 
@@ -237,8 +322,9 @@ score = ( w_lexical  × BM25归一化
 
 - **BM25**：FTS5 全文索引。索引的是**自定义分词结果**（中文按字 + 二元组，英文按词），
   因为 FTS5 内置的 `unicode61` 会把一整段中文当成单个 token，中文召回会直接失效。
-- **向量**：默认本地哈希向量（signed hashing trick），字符 n-gram + 词元混合，无需下载模型；
-  配了 embedding 网关就换成网关向量，网关挂了自动退回本地。
+- **向量**：默认本地 bge-small-zh-v1.5（int8 ONNX，512 维，CLS pooling + L2 归一化）。
+  分词用仓库自带的纯 Python BertTokenizer，不需要 transformers / torch。
+  模型或 onnxruntime 缺失时自动退回内置哈希向量（signed hashing trick），功能不中断。
 - **时效**：越久没用分数越低；被使用过会回升。
 
 ## 记忆生命周期
@@ -274,16 +360,20 @@ memcore/
 ├── memcore/
 │   ├── config.py      # 配置（env + json 双通道）
 │   ├── db.py          # SQLite schema、FTS5、触发器
-│   ├── store.py       # 记忆仓库：去重合并、衰减、会话
-│   ├── embed.py       # 哈希向量 / 远端 embedding
+│   ├── store.py       # 记忆仓库：去重合并、衰减、会话、向量重建
+│   ├── embed.py       # 向量提供方分派（local / hash / remote）
+│   ├── embed_local.py # 本地 ONNX 向量模型
+│   ├── tokenizer.py   # 纯标准库 BertTokenizer
 │   ├── retrieve.py    # 混合检索与上下文渲染
-│   ├── distill.py     # 规则 + LLM 记忆抽取
+│   ├── distill.py     # 规则 + 可配置抽取模型
 │   ├── mcp.py         # MCP stdio 服务端（8 个工具）
 │   ├── hooks.py       # Claude Code hooks
 │   ├── install.py     # 宿主配置生成
 │   └── cli.py         # 命令行
-├── scripts/install.sh
+├── scripts/install.sh     # 离线安装器
 ├── scripts/uninstall.sh
+├── scripts/fetch_vendor.py # 开发机用：把 wheel/模型拉进 vendor/
+├── vendor/                # 离线资源（wheel + 本地模型）
 ├── docs/PITFALLS.md   # 真机踩坑记录
 ├── setup.py
 └── tests/test_memcore.py
@@ -296,4 +386,12 @@ memcore/
 
 ## License
 
-MIT
+MIT（代码）
+
+随仓库分发的第三方组件：
+
+| 组件 | 许可 | 说明 |
+|---|---|---|
+| `bge-small-zh-v1.5`（int8 ONNX 导出） | MIT（BAAI/bge-embedding） | 本地向量模型，23.9 MB |
+| numpy 1.26.4 wheel | BSD-3-Clause | 向量计算 |
+| onnxruntime wheel | MIT | ONNX 推理 |

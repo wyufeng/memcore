@@ -9,5 +9,11 @@
 *.jpg binary
 *.zip binary
 
+# vendor 目录：wheel 与模型文件必须按二进制处理，否则会被换行符破坏
+*.whl binary
+*.onnx binary
+vendor/models/**/vocab.txt -text
+vendor/models/**/tokenizer.json -text
+
 # shell 脚本强制 LF + 可执行
 *.sh text eol=lf

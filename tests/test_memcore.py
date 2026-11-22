@@ -225,6 +225,183 @@ class TestEmbed(unittest.TestCase):
         self.assertEqual(embedmod.cosine([1.0, 2.0], [1.0]), 0.0)
 
 
+class TestTokenizer(unittest.TestCase):
+    """纯标准库 BertTokenizer 的正确性。"""
+
+    def setUp(self):
+        from memcore.tokenizer import BertTokenizer
+
+        # 构造一个极小词表，覆盖 [UNK]/[CLS]/[SEP]/[PAD]、普通词、中文字
+        vocab = [
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]",
+            "hello", "world", "user", "prefers", "chinese",
+            "backup", "center", "##ing", "##s",
+            "备", "份", "中", "心", "用", "户", ",",
+        ]
+        self.vocab = vocab
+        self.tok = BertTokenizer(vocab=vocab, do_lower_case=True)
+        self.ids = {t: i for i, t in enumerate(vocab)}
+
+    def test_special_tokens(self):
+        ids = self.tok.convert_tokens_to_ids(["[CLS]", "[SEP]", "[UNK]"])
+        self.assertEqual(ids, [self.ids["[CLS]"], self.ids["[SEP]"],
+                                self.ids["[UNK]"]])
+
+    def test_wordpiece_continuation(self):
+        toks = self.tok.tokenize("backuping")
+        self.assertEqual(toks, ["backup", "##ing"])
+
+    def test_unknown_token(self):
+        toks = self.tok.tokenize("zzzzz")
+        self.assertIn("[UNK]", toks)
+
+    def test_chinese_char_split(self):
+        toks = self.tok.tokenize("备份中心")
+        self.assertEqual(toks, ["备", "份", "中", "心"])
+
+    def test_punctuation_split(self):
+        toks = self.tok.tokenize("hello, world")
+        self.assertIn(",", toks)
+        self.assertIn("hello", toks)
+
+    def test_encode_shape_and_specials(self):
+        enc = self.tok.encode("hello world", max_len=8)
+        self.assertEqual(len(enc["input_ids"]), 8)
+        self.assertEqual(len(enc["attention_mask"]), 8)
+        self.assertEqual(len(enc["token_type_ids"]), 8)
+        # [CLS] hello world [SEP] + 4 个 [PAD]
+        self.assertEqual(enc["input_ids"][0], self.ids["[CLS]"])
+        self.assertEqual(enc["input_ids"][3], self.ids["[SEP]"])
+        self.assertEqual(enc["input_ids"][4], self.ids["[PAD]"])
+        self.assertEqual(enc["attention_mask"][:4], [1, 1, 1, 1])
+        self.assertEqual(enc["attention_mask"][4:], [0, 0, 0, 0])
+
+    def test_encode_truncates_long_text(self):
+        enc = self.tok.encode("hello " * 100, max_len=16)
+        self.assertEqual(len(enc["input_ids"]), 16)
+        self.assertEqual(enc["input_ids"][0], self.ids["[CLS]"])
+        # 文本被截断填满，[SEP] 落在末尾，没有 padding
+        self.assertEqual(enc["input_ids"][-1], self.ids["[SEP]"])
+        self.assertEqual(sum(enc["attention_mask"]), 16)
+
+
+class TestExtractConfig(unittest.TestCase):
+    """抽取模型配置与请求体构造。"""
+
+    def test_effective_extract_prefers_extract(self):
+        cfg = Config()
+        cfg.llm_base_url = "http://llm.local/v1"
+        cfg.llm_model = "old-model"
+        cfg.extract_base_url = "http://extract.local/v1"
+        cfg.extract_model = "new-model"
+        cfg.use_llm = True
+        ex = cfg.effective_extract()
+        self.assertEqual(ex["base_url"], "http://extract.local/v1")
+        self.assertEqual(ex["model"], "new-model")
+        self.assertTrue(ex["enabled"])
+
+    def test_effective_extract_falls_back_to_llm(self):
+        cfg = Config()
+        cfg.llm_base_url = "http://llm.local/v1"
+        cfg.llm_model = "fallback-model"
+        cfg.use_llm = True
+        ex = cfg.effective_extract()
+        self.assertEqual(ex["base_url"], "http://llm.local/v1")
+        self.assertEqual(ex["model"], "fallback-model")
+        self.assertTrue(ex["enabled"])
+
+    def test_effective_extract_disabled_without_model(self):
+        cfg = Config()
+        cfg.use_llm = True
+        ex = cfg.effective_extract()
+        self.assertFalse(ex["enabled"])
+
+    def test_api_key_masked_in_to_dict(self):
+        cfg = Config()
+        cfg.extract_api_key = "secret-key"
+        self.assertEqual(cfg.to_dict()["extract_api_key"], "***")
+
+    def test_build_chat_request_openai(self):
+        url, payload = distillmod._build_chat_request(
+            "http://gw.local/v1", "qwen", "hello", 0.2, "PROMPT {text}"
+        )
+        self.assertEqual(url, "http://gw.local/v1/chat/completions")
+        self.assertEqual(payload["model"], "qwen")
+        self.assertEqual(payload["temperature"], 0.2)
+        # {text} 占位符被替换
+        self.assertEqual(payload["messages"][-1]["content"], "PROMPT hello")
+
+    def test_build_chat_request_bare_url_adds_v1(self):
+        url, _ = distillmod._build_chat_request(
+            "http://gw.local", "m", "t", 0.1, "P {text}"
+        )
+        self.assertEqual(url, "http://gw.local/v1/chat/completions")
+
+    def test_build_chat_request_ollama(self):
+        url, payload = distillmod._build_chat_request(
+            "http://127.0.0.1:11434/api/chat", "qwen2.5:7b", "hi", 0.1, "P {text}"
+        )
+        self.assertEqual(url, "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(payload["options"]["temperature"], 0.1)
+        self.assertFalse(payload["stream"])
+
+    def test_build_chat_request_ollama_bare(self):
+        url, _ = distillmod._build_chat_request(
+            "http://127.0.0.1:11434", "qwen2.5:7b", "hi", 0.1, "P {text}"
+        )
+        self.assertEqual(url, "http://127.0.0.1:11434/api/chat")
+
+
+class TestEmbedProvider(unittest.TestCase):
+    """embed_provider 分派逻辑。"""
+
+    def test_hash_provider(self):
+        cfg = Config()
+        cfg.embed_provider = "hash"
+        cfg.embed_dim = 64
+        emb = embedmod.get_embedder(cfg)
+        self.assertEqual(emb.name, "hash")
+        self.assertEqual(len(emb.embed("x")), 64)
+
+    def test_remote_without_config_falls_back_to_hash(self):
+        cfg = Config()
+        cfg.embed_provider = "remote"
+        cfg.embed_base_url = ""
+        cfg.embed_model = ""
+        emb = embedmod.get_embedder(cfg)
+        self.assertEqual(emb.name, "hash")
+
+    def test_auto_never_raises(self):
+        cfg = Config()
+        cfg.embed_provider = "auto"
+        cfg.embed_model_path = "/nonexistent/path/xyz"
+        emb = embedmod.get_embedder(cfg)
+        self.assertIn(emb.name, ("hash", "local-onnx", "remote"))
+
+
+class TestLocalModelDiscovery(unittest.TestCase):
+    """本地模型路径探测（不加载模型）。"""
+
+    def test_describe_missing_model(self):
+        from memcore import embed_local
+
+        cfg = Config()
+        cfg.embed_model_path = "/nonexistent/model/dir"
+        info = embed_local.describe_local_model(cfg)
+        self.assertFalse(info["found"])
+
+    def test_find_model_dir_in_vendor(self):
+        from memcore import embed_local
+
+        repo = Path(__file__).resolve().parent.parent
+        model_dir = repo / "vendor" / "models" / "bge-small-zh-v1.5"
+        if not (model_dir / "vocab.txt").exists():
+            self.skipTest("vendor 模型未下载")
+        found = embed_local._find_model_dir(None)
+        self.assertIsNotNone(found)
+        self.assertTrue((found / "vocab.txt").exists())
+
+
 class TestHelpers(unittest.TestCase):
     def test_normalize(self):
         self.assertEqual(normalize("Hello,  World!"), "hello world")
