@@ -839,6 +839,45 @@ class TestInstall(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_install_opencode_cleans_legacy_duplicates(self):
+        """历史版本写入过重复项，重复安装后应被清理。"""
+        import memcore.install as inst
+
+        tmp = tempfile.mkdtemp()
+        home = Path(tmp)
+        try:
+            base = home / ".config" / "opencode"
+            base.mkdir(parents=True)
+            path = base / "opencode.json"
+            # 旧版本留下的重复项
+            path.write_text(json.dumps(
+                {"$schema": "https://opencode.ai/config.json",
+                 "plugin": ["./plugins", "./plugins"]},
+                ensure_ascii=False), encoding="utf-8")
+
+            orig_home = Path.home
+            orig_validate = inst._validate_opencode_config
+            Path.home = staticmethod(lambda: home)
+            inst._validate_opencode_config = lambda p: ""
+            try:
+                inst.install_opencode(Config(), dry_run=False)
+            finally:
+                Path.home = orig_home
+                inst._validate_opencode_config = orig_validate
+
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for key in ("plugin", "plugins"):
+                arr = data.get(key) or []
+                self.assertEqual(len(arr), len(set(arr)), f"{key} 有重复项：{arr}")
+            # 插件目录必须带 package.json + main
+            for d in ("plugin", "plugins"):
+                pkg = base / d / "package.json"
+                self.assertTrue(pkg.exists(), f"{d}/package.json 缺失")
+                self.assertIn("main", json.loads(pkg.read_text(encoding="utf-8")))
+            self.assertIn("memcore", data.get("mcp", {}))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 class TestHooks(unittest.TestCase):
     def test_transcript_extraction(self):

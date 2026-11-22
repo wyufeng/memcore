@@ -221,6 +221,8 @@ def _pick_plugin_key(path: Path, data: Dict[str, Any], dry_run: bool) -> str:
         for entry in ("./plugin", "./plugins"):
             if entry not in arr:
                 arr.append(entry)
+        seen = set()
+        arr = [x for x in arr if not (x in seen or seen.add(x))]
         trial[key] = arr
         if dry_run:
             return key
@@ -294,11 +296,19 @@ def install_opencode(cfg: Config, dry_run: bool = False) -> Dict[str, Any]:
     if dry_run:
         _write_json(path, data, dry_run)
     else:
+        # 选中的键：补齐两个目录并去重
         arr = [x for x in (data.get(key) or []) if isinstance(x, str)]
         for entry in ("./plugin", "./plugins"):
             if entry not in arr:
                 arr.append(entry)
-        data[key] = arr
+        seen = set()
+        data[key] = [x for x in arr if not (x in seen or seen.add(x))]
+        # 另一个键（历史遗留）也顺手去重，避免留下重复项
+        other = "plugins" if key == "plugin" else "plugin"
+        if isinstance(data.get(other), list):
+            seen2 = set()
+            data[other] = [x for x in data[other]
+                           if isinstance(x, str) and not (x in seen2 or seen2.add(x))]
         _write_json(path, data, dry_run)
 
     return {
