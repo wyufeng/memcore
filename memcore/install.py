@@ -354,7 +354,7 @@ export const MemcorePlugin = async ({ directory, worktree }) => {
   const candidates = [worktree, directory, process.cwd()];
   let cwd = "";
   for (const c of candidates) {
-    if (c && c !== "/" && c !== "\\") { cwd = c; break; }
+    if (c && c.length > 1 && c.charAt(0) === "/") { cwd = c; break; }
   }
   if (!cwd) cwd = directory || process.cwd() || ".";
   let cached = "";

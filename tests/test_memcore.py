@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -908,15 +909,47 @@ class TestOpencodePluginScope(unittest.TestCase):
         from memcore.install import opencode_plugin_js
 
         js = opencode_plugin_js()
-        self.assertIn('c !== "/"', js)
         self.assertIn("worktree", js)
         self.assertIn("directory", js)
+        self.assertIn("process.cwd()", js)
+        # 根目录判断不能产生转义歧义（曾导致 JS 语法错误 Unterminated string literal）
+        self.assertNotIn('!== "\\"', js)
+        self.assertNotIn('!== "\\\\"', js)
 
-    def test_plugin_js_keeps_cwd_candidates(self):
+    def test_plugin_js_is_valid_javascript(self):
+        """生成的插件 JS 必须能被 node 解析，否则 opencode 静默不加载。"""
         from memcore.install import opencode_plugin_js
 
         js = opencode_plugin_js()
-        self.assertIn("process.cwd()", js)
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("无 node，跳过 JS 语法检查")
+        tmp = tempfile.mkdtemp()
+        try:
+            p = Path(tmp) / "memcore.js"
+            p.write_text(js, encoding="utf-8")
+            r = subprocess.run([node, "--check", str(p)],
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr[:500])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_plugin_index_js_is_valid_javascript(self):
+        import memcore.install as inst
+
+        tmp = tempfile.mkdtemp()
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("无 node，跳过 JS 语法检查")
+        try:
+            base = Path(tmp)
+            inst._opencode_plugin_dir_files(base, "plugin")
+            for name in ("memcore.js", "index.js"):
+                r = subprocess.run([node, "--check", str(base / "plugin" / name)],
+                                   capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, f"{name}: {r.stderr[:400]}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestHooks(unittest.TestCase):
