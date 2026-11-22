@@ -1,0 +1,13 @@
+# 默认按文本处理，检出时统一 LF（Linux 目标机必须）
+* text=auto eol=lf
+
+# 二进制不做换行转换
+*.db binary
+*.db-wal binary
+*.db-shm binary
+*.png binary
+*.jpg binary
+*.zip binary
+
+# shell 脚本强制 LF + 可执行
+*.sh text eol=lf
