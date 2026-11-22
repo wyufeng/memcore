@@ -974,5 +974,78 @@ class TestHooks(unittest.TestCase):
         self.assertEqual(_transcript_text("/nonexistent/x.jsonl"), "")
 
 
+class TestMemReport(unittest.TestCase):
+    """doctor --mem 内存体检能力。"""
+
+    def test_mem_report_returns_lines(self):
+        from memcore import cli
+
+        lines = cli.mem_report()
+        self.assertIsInstance(lines, list)
+        self.assertTrue(lines, "内存报告不应为空")
+        joined = "\n".join(lines)
+        self.assertIn("memcore 进程", joined)
+        self.assertIn("本地向量模型", joined)
+
+    def test_mem_report_handles_missing_meminfo(self):
+        import builtins
+
+        from memcore import cli
+
+        orig = builtins.open
+
+        def _fake_open(path, *a, **kw):
+            if str(path) == "/proc/meminfo":
+                raise OSError("not linux")
+            return orig(path, *a, **kw)
+
+        builtins.open = _fake_open
+        try:
+            lines = cli.mem_report()
+            self.assertTrue(any("无法读取" in ln for ln in lines))
+        finally:
+            builtins.open = orig
+
+    def test_self_rss_positive(self):
+        from memcore import cli
+
+        rss = cli._self_rss_mb()
+        self.assertGreater(rss, 0.0)
+
+    def test_doctor_mem_flag_registered(self):
+        from memcore import cli
+
+        parser = cli.build_parser()
+        args = parser.parse_args(["doctor", "--mem"])
+        self.assertTrue(args.mem)
+
+    def test_doctor_runs_with_mem(self):
+        from memcore import cli
+
+        tmp = tempfile.mkdtemp()
+        try:
+            cfg = Config()
+            cfg.home = Path(tmp) / "home"
+            cfg.db_path = Path(tmp) / "memories.db"
+            cfg.ensure_dirs()
+            con = dbmod.connect(cfg.db_path)
+            dbmod.init_db(con)
+            store = MemoryStore(con, embedder=embedmod.HashEmbedder(dim=128), cfg=cfg)
+
+            parser = cli.build_parser()
+            args = parser.parse_args(["doctor", "--mem"])
+            import io
+            import contextlib
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.cmd_doctor(args, cfg, store)
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("memcore 进程", out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

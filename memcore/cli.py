@@ -207,7 +207,135 @@ def cmd_doctor(args, cfg, store) -> int:
         print(f"  {host:<11}: {path or '未安装'}")
     st = store.stats()
     print(f"  memories   : {st['active']} 活跃 / {st['archived']} 归档")
+    if getattr(args, "mem", False):
+        print()
+        for line in mem_report():
+            print(f"  {line}")
     return 0
+
+
+def mem_report() -> list:
+    """内存体检：报告系统内存、swap、以及本进程/本地模型的内存占用。
+
+    在 1~2GB 的小内存机器上，memcore 本身（~110MB）+ 宿主（opencode ~420MB）
+    很容易把系统压到 "Under memory pressure"。这个报告用来快速判断
+    内存到底被谁吃了，而不是靠猜。
+    """
+    lines = []
+
+    total_mb = avail_mb = None
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            info = {}
+            for line in fh:
+                k, _, v = line.partition(":")
+                info[k.strip()] = int(v.split()[0])  # kB
+        total_mb = info.get("MemTotal", 0) / 1024
+        avail_mb = info.get("MemAvailable", 0) / 1024
+        used_mb = (info.get("MemTotal", 0) - info.get("MemAvailable", 0)) / 1024
+        lines.append(
+            f"系统内存    : 总 {total_mb:.0f}MB / 已用 {used_mb:.0f}MB / 可用 {avail_mb:.0f}MB"
+        )
+    except Exception:
+        lines.append("系统内存    : 无法读取 /proc/meminfo（非 Linux）")
+
+    try:
+        swap_total = swap_free = 0
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("SwapTotal:"):
+                    swap_total = int(line.split()[1])
+                elif line.startswith("SwapFree:"):
+                    swap_free = int(line.split()[1])
+        if swap_total:
+            used = (swap_total - swap_free) / 1024
+            lines.append(
+                f"swap        : 总 {swap_total/1024:.0f}MB / 已用 {used:.0f}MB"
+                + ("  ⚠ 已在换页，OOM 风险高" if used > 32 else "")
+            )
+        else:
+            lines.append("swap        : 未配置（无 swap 缓冲，内存耗尽会直接触发 OOM kill）")
+    except Exception:
+        pass
+
+    lines.append(f"memcore 进程: RSS {_self_rss_mb():.0f}MB")
+
+    try:
+        from .embed_local import try_local_embedder
+
+        before = _self_rss_mb()
+        emb = try_local_embedder(None)
+        after = _self_rss_mb()
+        if emb is not None:
+            lines.append(
+                f"本地向量模型: 加载后进程 RSS {after:.0f}MB"
+                f"（模型自身约 +{max(0.0, after - before):.0f}MB，dim={emb.dim}）"
+            )
+            del emb
+        else:
+            lines.append("本地向量模型: 无法加载（onnxruntime 缺失或模型文件损坏）")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"本地向量模型: 测量失败 ({exc})")
+
+    if total_mb and avail_mb is not None:
+        if total_mb < 2048:
+            lines.append(
+                f"⚠ 风险      : 机器总内存仅 {total_mb:.0f}MB，"
+                "宿主 + memcore + 其它服务易触发内存压力；"
+                "建议 embed_threads=1，并停用重复的嵌入服务"
+            )
+        elif avail_mb < 256:
+            lines.append(f"⚠ 风险      : 可用内存仅 {avail_mb:.0f}MB，接近耗尽")
+
+    return lines
+
+
+def _self_rss_mb() -> float:
+    """当前进程 RSS（MB），跨平台，无需 psutil。"""
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / 1024
+        except Exception:
+            pass
+    elif sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(_PMC)
+            fn = ctypes.windll.kernel32.K32GetProcessMemoryInfo
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD]
+            fn.restype = ctypes.c_int
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            if fn(handle, ctypes.byref(pmc), pmc.cb):
+                return pmc.WorkingSetSize / (1024 * 1024)
+        except Exception:
+            pass
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return usage / (1024 * 1024) if sys.platform == "darwin" else usage / 1024
+    except Exception:
+        return 0.0
 
 
 def _find_host(name: str) -> str:
@@ -452,6 +580,8 @@ def build_parser() -> argparse.ArgumentParser:
     o = sub.add_parser("doctor", help="环境自检")
     o.add_argument("--probe", action="store_true",
                    help="额外真实调用一次抽取模型，验证端点可达")
+    o.add_argument("--mem", action="store_true",
+                   help="内存体检：系统内存/swap/本地模型占用与 OOM 风险")
     o.set_defaults(func=cmd_doctor)
 
     rb = sub.add_parser("reembed", help="用当前向量模型重建全部向量")
