@@ -352,6 +352,111 @@ class TestExtractConfig(unittest.TestCase):
         self.assertEqual(url, "http://127.0.0.1:11434/api/chat")
 
 
+class TestExtractDiagnostics(unittest.TestCase):
+    """抽取失败要能被看见，而不是静默退回规则抽取。"""
+
+    def _serve_once(self, payload, status=200):
+        """起一个本地 HTTP 服务，返回一次 payload。"""
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                body = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def test_llm_extract_parses_openai_response(self):
+        srv = self._serve_once({"choices": [{"message": {"content": json.dumps(
+            [{"content": "用户偏好中文", "kind": "pref"}], ensure_ascii=False)}}]})
+        try:
+            url = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+            items = distillmod.llm_extract("t", url, "", "m")
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["content"], "用户偏好中文")
+            self.assertEqual(items[0]["kind"], "pref")
+            self.assertEqual(distillmod.LAST_LLM_ERROR, "")
+        finally:
+            srv.shutdown()
+
+    def test_llm_extract_accepts_text_field_alias(self):
+        """不同模型可能用 text 而非 content 字段。"""
+        srv = self._serve_once({"choices": [{"message": {"content": json.dumps(
+            [{"text": "用 text 字段写的记忆", "type": "pref"}], ensure_ascii=False)}}]})
+        try:
+            url = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+            items = distillmod.llm_extract("t", url, "", "m")
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["content"], "用 text 字段写的记忆")
+            self.assertEqual(items[0]["kind"], "pref")
+        finally:
+            srv.shutdown()
+
+    def test_llm_extract_connection_failure_records_error(self):
+        items = distillmod.llm_extract(
+            "t", "http://127.0.0.1:1/v1", "", "m", timeout=3
+        )
+        self.assertEqual(items, [])
+        self.assertTrue(distillmod.LAST_LLM_ERROR)
+        self.assertIn("连接失败", distillmod.LAST_LLM_ERROR)
+
+    def test_llm_extract_non_json_response_records_error(self):
+        srv = self._serve_once({"choices": [{"message": {"content": "抱歉我不知道"}}]})
+        try:
+            url = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+            items = distillmod.llm_extract("t", url, "", "m")
+            self.assertEqual(items, [])
+            self.assertIn("不是 JSON 数组", distillmod.LAST_LLM_ERROR)
+        finally:
+            srv.shutdown()
+
+    def test_llm_extract_missing_content_field_records_error(self):
+        srv = self._serve_once({"choices": [{"message": {"content": json.dumps(
+            [{"foo": "没有 content 也没有 text"}], ensure_ascii=False)}}]})
+        try:
+            url = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+            items = distillmod.llm_extract("t", url, "", "m")
+            self.assertEqual(items, [])
+            self.assertIn("content/text", distillmod.LAST_LLM_ERROR)
+        finally:
+            srv.shutdown()
+
+    def test_distill_marks_source_rule_on_failure(self):
+        cfg = Config()
+        cfg.use_llm = True
+        cfg.extract_base_url = "http://127.0.0.1:1/v1"
+        cfg.extract_model = "m"
+        cfg.extract_timeout = 3
+        items = distillmod.distill("用户: 我偏好中文回答。", cfg)
+        self.assertTrue(items)  # 回落到规则抽取，仍有产出
+        self.assertEqual(distillmod.LAST_SOURCE, "rule")
+        self.assertTrue(distillmod.LAST_LLM_ERROR)
+
+    def test_distill_marks_source_llm_on_success(self):
+        srv = self._serve_once({"choices": [{"message": {"content": json.dumps(
+            [{"content": "来自抽取模型的记忆", "kind": "fact"}], ensure_ascii=False)}}]})
+        try:
+            cfg = Config()
+            cfg.use_llm = True
+            cfg.extract_base_url = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+            cfg.extract_model = "m"
+            items = distillmod.distill("随便什么文本", cfg)
+            self.assertEqual(distillmod.LAST_SOURCE, "llm")
+            self.assertEqual(items[0]["content"], "来自抽取模型的记忆")
+        finally:
+            srv.shutdown()
+
+
 class TestEmbedProvider(unittest.TestCase):
     """embed_provider 分派逻辑。"""
 

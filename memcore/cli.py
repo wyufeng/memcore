@@ -140,6 +140,17 @@ def cmd_distill(args, cfg, store) -> int:
     for m in saved:
         print(f"✓ [{m['kind']}] {m['content']}")
     print(f"共 {len(saved)} 条")
+    # 抽取来源提示：配了抽取模型却没生效时必须看得见
+    if getattr(distillmod, "LAST_SOURCE", "rule") == "llm":
+        print("（来源：抽取模型）")
+    else:
+        err = getattr(distillmod, "LAST_LLM_ERROR", "")
+        try:
+            eff = cfg.effective_extract()
+            if eff.get("enabled"):
+                print(f"（来源：内置规则抽取 —— 抽取模型未生效{f'：{err}' if err else ''}）")
+        except Exception:
+            pass
     return 0
 
 
@@ -174,6 +185,8 @@ def cmd_doctor(args, cfg, store) -> int:
     ex = cfg.effective_extract()
     if ex["enabled"]:
         print(f"  抽取模型   : {ex['model']} @ {ex['base_url']} (temp={ex['temperature']})")
+        if getattr(args, "probe", False):
+            print(f"  抽取模型探活: {_probe_extract(ex)}")
     else:
         print("  抽取模型   : 未配置（走规则抽取）")
     print(f"  llm        : {'已配置 ' + cfg.llm_model if cfg.use_llm and cfg.llm_model else '未配置（走规则抽取）'}")
@@ -205,6 +218,26 @@ def _local_model_status(cfg) -> str:
         f"{info.get('name', 'local')} @ {info.get('path')} "
         f"(dim={info.get('dim')}, size={info.get('size_mb')}MB)"
     )
+
+
+def _probe_extract(ex: dict) -> str:
+    """真实调用一次抽取模型，验证端点可达且能解析出条目。"""
+    try:
+        items = distillmod.llm_extract(
+            "用户: 我偏好使用简体中文。",
+            ex.get("base_url", ""),
+            ex.get("api_key", ""),
+            ex.get("model", ""),
+            timeout=min(float(ex.get("timeout") or 60.0), 30.0),
+            max_items=3,
+            temperature=float(ex.get("temperature", 0.1)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"探活异常 ({exc})"
+    if items:
+        return f"可用（返回 {len(items)} 条）"
+    err = getattr(distillmod, "LAST_LLM_ERROR", "") or "未知原因"
+    return f"不可用（{err}）"
 
 
 # 允许通过 CLI 修改的配置项
@@ -390,6 +423,8 @@ def build_parser() -> argparse.ArgumentParser:
     y.set_defaults(func=cmd_decay)
 
     o = sub.add_parser("doctor", help="环境自检")
+    o.add_argument("--probe", action="store_true",
+                   help="额外真实调用一次抽取模型，验证端点可达")
     o.set_defaults(func=cmd_doctor)
 
     rb = sub.add_parser("reembed", help="用当前向量模型重建全部向量")

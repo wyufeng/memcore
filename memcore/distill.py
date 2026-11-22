@@ -15,6 +15,11 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Sequence
 
+# 最近一次抽取失败的诊断信息（供 CLI / doctor 展示）
+LAST_LLM_ERROR: str = ""
+# 最近一次抽取的实际来源：'llm'（抽取模型）或 'rule'（内置规则）
+LAST_SOURCE: str = "rule"
+
 # 中文/英文里表明显值得长期记住的信号词
 _SIGNALS = [
     ("pref", ["我偏好", "我喜欢", "我不喜欢", "我讨厌", "我习惯", "请以后", "以后都",
@@ -189,12 +194,18 @@ def llm_extract(
 ) -> List[Dict[str, Any]]:
     """调用内网 OpenAI 兼容网关做抽取；失败则返回空列表。
 
+    失败原因通过 ``LAST_LLM_ERROR`` 全局变量暴露，便于 CLI 提示，
+    避免"配了抽取模型却静默退回规则抽取"这种查不出问题的情况。
+
     base_url 支持：
     - http://host:port/v1        （OpenAI 兼容网关，如 vLLM / Xinference）
     - http://host:port           （自动补 /v1）
     - http://host:port/api       （Ollama 原生接口，自动转 /api/chat）
     """
+    global LAST_LLM_ERROR
+    LAST_LLM_ERROR = ""
     if not (base_url and model):
+        LAST_LLM_ERROR = "抽取模型地址或模型名为空"
         return []
     endpoint, payload = _build_chat_request(base_url, model, text, temperature, prompt)
     req = urllib.request.Request(
@@ -211,10 +222,31 @@ def llm_extract(
             data = json.loads(resp.read().decode("utf-8"))
         if "choices" in data:
             content = data["choices"][0]["message"]["content"]
-        else:
+        elif "message" in data:
             # Ollama 原生返回：message.content
             content = data["message"]["content"]
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError):
+        elif "response" in data:
+            # llama.cpp server 原生返回：response
+            content = data["response"]
+        else:
+            LAST_LLM_ERROR = f"无法识别的响应结构：{list(data.keys())[:6]}"
+            return []
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "ignore")[:200]
+        except Exception:
+            body = ""
+        LAST_LLM_ERROR = f"HTTP {e.code} {endpoint} {body}"
+        return []
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        LAST_LLM_ERROR = f"连接失败 {endpoint}：{e}"
+        return []
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        LAST_LLM_ERROR = f"响应解析失败 {endpoint}：{type(e).__name__} {e}"
+        return []
+
+    if not isinstance(content, str):
+        LAST_LLM_ERROR = f"响应 content 不是字符串：{type(content).__name__}"
         return []
 
     # 去掉可能的 markdown 围栏
@@ -227,26 +259,44 @@ def llm_extract(
     except ValueError:
         m = re.search(r"\[.*\]", content, re.S)
         if not m:
+            LAST_LLM_ERROR = f"响应不是 JSON 数组：{content[:120]!r}"
             return []
         try:
             items = json.loads(m.group(0))
-        except ValueError:
+        except ValueError as e:
+            LAST_LLM_ERROR = f"JSON 解析失败：{e}；原始内容：{content[:120]!r}"
             return []
     if not isinstance(items, list):
+        LAST_LLM_ERROR = f"期望 JSON 数组，实际是 {type(items).__name__}"
         return []
+
 
     out: List[Dict[str, Any]] = []
     for it in items:
         if not isinstance(it, dict):
             continue
-        content_s = str(it.get("content") or "").strip()
+        # 兼容不同模型/提示词写出的字段名：content / text / memory / fact / item
+        content_s = ""
+        for key in ("content", "text", "memory", "fact", "item", "value"):
+            v = it.get(key)
+            if isinstance(v, str) and v.strip():
+                content_s = v.strip()
+                break
+            if isinstance(v, dict):
+                for k2 in ("content", "text", "value"):
+                    v2 = v.get(k2)
+                    if isinstance(v2, str) and v2.strip():
+                        content_s = v2.strip()
+                        break
+                if content_s:
+                    break
         if not content_s:
             continue
-        kind = str(it.get("kind") or "fact")
+        kind = str(it.get("kind") or it.get("type") or "fact")
         if kind not in ("fact", "pref", "decision", "env", "task"):
             kind = "fact"
         try:
-            imp = float(it.get("importance", 0.6))
+            imp = float(it.get("importance", it.get("score", 0.6)))
         except (TypeError, ValueError):
             imp = 0.6
         out.append({
@@ -257,6 +307,14 @@ def llm_extract(
         })
         if len(out) >= max_items:
             break
+    if not out:
+        if not items:
+            LAST_LLM_ERROR = "抽取模型返回空数组（认为无可抽取内容）"
+        else:
+            LAST_LLM_ERROR = (
+                "抽取模型返回了 %d 条，但没有一条包含可用的 content/text 字段"
+                % len(items)
+            )
     return out
 
 
@@ -283,6 +341,7 @@ def distill(
     max_items: int = 0,
 ) -> List[Dict[str, Any]]:
     """组合抽取：优先配置的抽取模型，失败或未配置时用规则。"""
+    global LAST_SOURCE
     try:
         eff = cfg.effective_extract()
     except Exception:
@@ -320,5 +379,10 @@ def distill(
             prompt=prompt or None,
         )
         if items:
+            LAST_SOURCE = "llm"
             return items
+        # LLM 没产出：回落规则抽取，但记录原因以便 CLI 提示
+        LAST_SOURCE = "rule"
+        return rule_extract(text, limit)
+    LAST_SOURCE = "rule"
     return rule_extract(text, limit)
