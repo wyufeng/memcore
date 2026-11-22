@@ -63,7 +63,12 @@ def project_scope(explicit: Optional[str] = None) -> str:
         if s.startswith(("project:", "session:", "global")):
             return s
         p = Path(s).expanduser()
-        name = p.name if (p.is_absolute() or len(p.parts) > 1) else s
+        stripped = s.strip()
+        if stripped in ("/", "\\"):
+            # 根目录没有名字，退回当前工作目录，避免落到 global
+            name = Path.cwd().name
+        else:
+            name = p.name if (p.is_absolute() or len(p.parts) > 1) else s
         return f"project:{name}" if name else "global"
     cwd = Path.cwd().name
     return f"project:{cwd}" if cwd else "global"

@@ -879,6 +879,46 @@ class TestInstall(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestScopeNormalization(unittest.TestCase):
+    """scope 归一化：根目录不能落到 global。"""
+
+    def test_root_path_falls_back_to_cwd(self):
+        from memcore.cli import project_scope
+
+        self.assertEqual(project_scope("/"), project_scope(None))
+
+    def test_absolute_path_uses_dirname(self):
+        from memcore.cli import project_scope
+
+        self.assertEqual(project_scope("/home/admin"), "project:admin")
+        self.assertEqual(project_scope("admin"), "project:admin")
+
+    def test_explicit_prefix_untouched(self):
+        from memcore.cli import project_scope
+
+        self.assertEqual(project_scope("project:x"), "project:x")
+        self.assertEqual(project_scope("global"), "global")
+        self.assertEqual(project_scope("session:s1"), "session:s1")
+
+
+class TestOpencodePluginScope(unittest.TestCase):
+    """插件的 cwd 选取：opencode 的 worktree 可能是根目录 "/"。"""
+
+    def test_plugin_js_skips_root_worktree(self):
+        from memcore.install import opencode_plugin_js
+
+        js = opencode_plugin_js()
+        self.assertIn('c !== "/"', js)
+        self.assertIn("worktree", js)
+        self.assertIn("directory", js)
+
+    def test_plugin_js_keeps_cwd_candidates(self):
+        from memcore.install import opencode_plugin_js
+
+        js = opencode_plugin_js()
+        self.assertIn("process.cwd()", js)
+
+
 class TestHooks(unittest.TestCase):
     def test_transcript_extraction(self):
         from memcore.hooks import _transcript_text

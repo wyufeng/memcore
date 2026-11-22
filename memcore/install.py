@@ -348,7 +348,15 @@ function recallContext(cwd) {
 }
 
 export const MemcorePlugin = async ({ directory, worktree }) => {
-  const cwd = worktree || directory || process.cwd();
+  // opencode 的 worktree 在非 git 目录下是 "/"（根目录），
+  // 直接用它会让 scope 落到 global，召不回项目记忆。
+  // 依次取 worktree / directory / cwd，跳过根目录与空值。
+  const candidates = [worktree, directory, process.cwd()];
+  let cwd = "";
+  for (const c of candidates) {
+    if (c && c !== "/" && c !== "\\") { cwd = c; break; }
+  }
+  if (!cwd) cwd = directory || process.cwd() || ".";
   let cached = "";
 
   return {
