@@ -198,11 +198,33 @@ def cmd_doctor(args, cfg, store) -> int:
     except Exception as exc:
         print(f"  fts5       : 不可用 ({exc})")
     for host in ("claude", "opencode"):
-        path = shutil.which(host)
+        path = _find_host(host)
         print(f"  {host:<11}: {path or '未安装'}")
     st = store.stats()
     print(f"  memories   : {st['active']} 活跃 / {st['archived']} 归档")
     return 0
+
+
+def _find_host(name: str) -> str:
+    """查找宿主可执行文件。
+
+    非交互 shell 不读 .bashrc，npm 全局 bin 常常不在 PATH 里，
+    只用 shutil.which 会误判成"未安装"。
+    """
+    p = shutil.which(name)
+    if p:
+        return p
+    home = Path.home()
+    for d in (home / ".npm-global" / "bin", home / ".bun" / "bin",
+              home / ".local" / "bin", home / ".volta" / "bin",
+              home / ".yarn" / "bin"):
+        cand = d / name
+        try:
+            if cand.exists() and os.access(str(cand), os.X_OK):
+                return str(cand)
+        except OSError:
+            continue
+    return ""
 
 
 def _local_model_status(cfg) -> str:

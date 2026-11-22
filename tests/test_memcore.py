@@ -795,6 +795,50 @@ class TestInstall(unittest.TestCase):
         self.assertIn("experimental.chat.system.transform", js)
         self.assertIn("output.system", js)
 
+    def test_opencode_plugin_dir_has_package_json_with_main(self):
+        """opencode 1.3+ 把插件目录当 npm 包装，缺 package.json/main 会安装失败。"""
+        import memcore.install as inst
+
+        tmp = tempfile.mkdtemp()
+        base = Path(tmp)
+        try:
+            files = inst._opencode_plugin_dir_files(base, "plugin")
+            pkg_path = base / "plugin" / "package.json"
+            self.assertTrue(pkg_path.exists())
+            pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
+            self.assertIn("main", pkg)
+            self.assertTrue((base / "plugin" / pkg["main"].lstrip("./")).exists())
+            self.assertTrue((base / "plugin" / "memcore.js").exists())
+            self.assertTrue((base / "plugin" / "index.js").exists())
+            self.assertEqual(len(files), 3)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_opencode_plugin_arrays_have_no_duplicates(self):
+        """plugin/plugins 数组不应出现重复条目。"""
+        import memcore.install as inst
+
+        tmp = tempfile.mkdtemp()
+        try:
+            base = Path(tmp)
+            for d in ("plugin", "plugins"):
+                inst._opencode_plugin_dir_files(base, d)
+            path = base / "opencode.json"
+            path.write_text(json.dumps({}), encoding="utf-8")
+            # 跳过 opencode 实测校验（测试环境无 opencode）
+            orig = inst._validate_opencode_config
+            inst._validate_opencode_config = lambda p: ""
+            try:
+                inst._pick_plugin_key(path, {}, False)
+            finally:
+                inst._validate_opencode_config = orig
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for key in ("plugin", "plugins"):
+                arr = data.get(key) or []
+                self.assertEqual(len(arr), len(set(arr)), f"{key} 有重复项：{arr}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 class TestHooks(unittest.TestCase):
     def test_transcript_extraction(self):

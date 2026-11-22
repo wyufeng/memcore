@@ -216,11 +216,11 @@ def _pick_plugin_key(path: Path, data: Dict[str, Any], dry_run: bool) -> str:
     candidates = ["plugin", "plugins"]
     for key in candidates:
         trial = dict(data)
-        arr = list(trial.get(key) or [])
-        if isinstance(arr, list) and not any(
-            isinstance(e, str) and "memcore" in e for e in arr
-        ):
-            arr.append("./plugins")
+        arr = [x for x in (trial.get(key) or []) if isinstance(x, str)]
+        # 两个目录都写上，兼容 1.x 单数与 1.15+ 复数，且不重复
+        for entry in ("./plugin", "./plugins"):
+            if entry not in arr:
+                arr.append(entry)
         trial[key] = arr
         if dry_run:
             return key
@@ -231,6 +231,36 @@ def _pick_plugin_key(path: Path, data: Dict[str, Any], dry_run: bool) -> str:
     return candidates[0]
 
 
+def _opencode_plugin_dir_files(base: Path, dirname: str) -> List[str]:
+    """写出一个 opencode 插件目录（目录即插件）。
+
+    opencode 1.x+ 把配置里的目录当作 npm 包安装，要求目录里有
+    package.json 且带 main 字段，缺一个就会报
+    "Plugin directory ... is missing package.json" 或
+    "must define package.json main"，
+    插件里的 .js 会被加载但目录插件安装失败。
+    """
+    d = base / dirname
+    d.mkdir(parents=True, exist_ok=True)
+    pkg = {
+        "name": "memcore-plugin",
+        "version": "1.0.0",
+        "type": "module",
+        "main": "./index.js",
+    }
+    (d / "package.json").write_text(
+        json.dumps(pkg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (d / "memcore.js").write_text(opencode_plugin_js(), encoding="utf-8")
+    (d / "index.js").write_text(
+        'import { MemcorePlugin } from "./memcore.js";\n'
+        "export { MemcorePlugin };\n"
+        "export default MemcorePlugin;\n",
+        encoding="utf-8",
+    )
+    return [str(d / "package.json"), str(d / "memcore.js"), str(d / "index.js")]
+
+
 def install_opencode(cfg: Config, dry_run: bool = False) -> Dict[str, Any]:
     """写入 opencode 的 MCP 配置与插件。
 
@@ -239,6 +269,10 @@ def install_opencode(cfg: Config, dry_run: bool = False) -> Dict[str, Any]:
 
     插件本体放在两个目录下（opencode 会自动发现 .js 文件），
     配置键名则实测确定，避免写出 opencode 不认的键。
+
+    注意：opencode 1.3+ 会把配置里的目录当 npm 包安装，
+    因此每个目录必须带 package.json（含 main），
+    否则报 "missing package.json" / "must define package.json main"。
     """
     base = Path.home() / ".config" / "opencode"
     path = base / "opencode.json"
@@ -248,24 +282,22 @@ def install_opencode(cfg: Config, dry_run: bool = False) -> Dict[str, Any]:
     mcp["memcore"] = opencode_mcp_entry(cfg)
     data["mcp"] = mcp
 
-    # 先把插件文件放好（校验时 opencode 可能会加载它）
-    written = []
+    # 先把插件目录放好（校验时 opencode 可能会加载它）
+    written: List[str] = []
     for dirname in ("plugin", "plugins"):
-        plugin_path = base / dirname / "memcore.js"
-        if not dry_run:
-            plugin_path.parent.mkdir(parents=True, exist_ok=True)
-            plugin_path.write_text(opencode_plugin_js(), encoding="utf-8")
-        written.append(str(plugin_path))
+        if dry_run:
+            written.append(str(base / dirname / "memcore.js"))
+        else:
+            written.extend(_opencode_plugin_dir_files(base, dirname))
 
     key = _pick_plugin_key(path, data, dry_run)
     if dry_run:
         _write_json(path, data, dry_run)
     else:
-        arr = list(data.get(key) or [])
-        if isinstance(arr, list) and not any(
-            isinstance(e, str) and "memcore" in e for e in arr
-        ):
-            arr.append("./plugins")
+        arr = [x for x in (data.get(key) or []) if isinstance(x, str)]
+        for entry in ("./plugin", "./plugins"):
+            if entry not in arr:
+                arr.append(entry)
         data[key] = arr
         _write_json(path, data, dry_run)
 

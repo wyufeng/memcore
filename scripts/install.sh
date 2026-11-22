@@ -198,6 +198,14 @@ fi
 
 # ---------- 6. 宿主接入 ----------
 
+# 非交互 shell 不读 .bashrc，npm 全局 bin 常常不在 PATH 里，
+# 这里把常见位置补进来，否则会误判"未安装 opencode/claude"。
+for d in "$HOME/.npm-global/bin" "$HOME/.bun/bin" "$HOME/.local/bin" \
+         "$HOME/.volta/bin" "$HOME/.yarn/bin"; do
+    [ -d "$d" ] && PATH="$PATH:$d"
+done
+export PATH
+
 case "${MEMCORE_SKIP_HOST:-0}" in
     1) log "跳过宿主配置（MEMCORE_SKIP_HOST=1）" ;;
     *)
