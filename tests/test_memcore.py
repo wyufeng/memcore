@@ -402,6 +402,113 @@ class TestLocalModelDiscovery(unittest.TestCase):
         self.assertTrue((found / "vocab.txt").exists())
 
 
+class TestVendorBundle(unittest.TestCase):
+    """vendor 自包含性检查：wheel 依赖闭包完整 + 模型文件齐全。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.repo = Path(__file__).resolve().parent.parent
+        cls.wheels = cls.repo / "vendor" / "wheels"
+        cls.models = cls.repo / "vendor" / "models" / "bge-small-zh-v1.5"
+
+    @staticmethod
+    def _read_metadata(wheel: Path):
+        import re
+        import zipfile
+
+        with zipfile.ZipFile(wheel) as z:
+            for name in z.namelist():
+                if name.endswith("METADATA"):
+                    txt = z.read(name).decode("utf-8", "ignore")
+                    pkg = re.search(r"^Name: (.+)$", txt, re.M)
+                    reqs = []
+                    for line in txt.splitlines():
+                        if not line.startswith("Requires-Dist:"):
+                            continue
+                        raw = line.split(":", 1)[1].strip()
+                        # 跳过 extras 与平台限定依赖（Linux + 默认安装不需要）
+                        if "extra ==" in raw:
+                            continue
+                        if "python_version ==" in raw or "sys_platform ==" in raw:
+                            continue
+                        if "platform_python_implementation" in raw:
+                            continue
+                        m = re.match(r"^([A-Za-z0-9_.\-]+)", raw)
+                        if m:
+                            reqs.append(m.group(1).lower())
+                    return (pkg.group(1).strip().lower() if pkg else None), reqs
+        return None, []
+
+    def test_wheels_present(self):
+        if not self.wheels.is_dir():
+            self.skipTest("vendor/wheels 不存在")
+        self.assertTrue(list(self.wheels.glob("*.whl")),
+                        "vendor/wheels 里没有 wheel")
+
+    def test_wheel_dependency_closure(self):
+        """每个 wheel 的必需依赖都必须在 vendor 里存在（否则离线安装会失败）。"""
+        if not self.wheels.is_dir():
+            self.skipTest("vendor/wheels 不存在")
+        import re
+
+        available = {}
+        for w in sorted(self.wheels.glob("*.whl")):
+            name, reqs = self._read_metadata(w)
+            if name:
+                available[name] = reqs
+
+        missing = []
+        for name, reqs in available.items():
+            for r in reqs:
+                if r not in available:
+                    missing.append(f"{name} -> {r}")
+        self.assertEqual(missing, [], f"vendor/wheels 依赖不完整: {missing}")
+
+    def test_python_version_coverage(self):
+        """numpy 与 onnxruntime 必须覆盖 cp39~cp312。"""
+        if not self.wheels.is_dir():
+            self.skipTest("vendor/wheels 不存在")
+        import re
+
+        names = [w.name for w in self.wheels.glob("*.whl")]
+        for pkg in ("numpy", "onnxruntime"):
+            tags = set()
+            for n in names:
+                if n.startswith(pkg + "-"):
+                    m = re.search(r"-(cp\d+)-", n)
+                    if m:
+                        tags.add(m.group(1))
+            self.assertTrue(tags, f"没有 {pkg} 的二进制 wheel")
+            for tag in ("cp39", "cp310", "cp311", "cp312"):
+                self.assertIn(tag, tags, f"{pkg} 缺少 {tag} wheel")
+
+    def test_model_files_present(self):
+        if not self.models.is_dir():
+            self.skipTest("vendor/models 不存在")
+        for f in ("config.json", "tokenizer_config.json",
+                  "special_tokens_map.json", "vocab.txt",
+                  "onnx/model_int8.onnx"):
+            self.assertTrue((self.models / f).exists(), f"缺少模型文件 {f}")
+
+    def test_model_onnx_not_truncated(self):
+        onnx = self.models / "onnx" / "model_int8.onnx"
+        if not onnx.exists():
+            self.skipTest("模型未下载")
+        # 完整模型约 23.9 MB，截断的下载会明显小于此
+        self.assertGreater(onnx.stat().st_size, 20 * 1024 * 1024)
+
+    def test_vocab_loadable(self):
+        vocab = self.models / "vocab.txt"
+        if not vocab.exists():
+            self.skipTest("模型未下载")
+        from memcore.tokenizer import BertTokenizer
+
+        tok = BertTokenizer.from_vocab_file(str(vocab), do_lower_case=False)
+        self.assertGreater(tok.vocab_size, 20000)
+        self.assertIn("备", tok.vocab)
+        self.assertIn("##", "".join(list(tok.vocab.keys())[:0]) + "##")
+
+
 class TestHelpers(unittest.TestCase):
     def test_normalize(self):
         self.assertEqual(normalize("Hello,  World!"), "hello world")

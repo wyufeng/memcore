@@ -121,7 +121,9 @@ chmod +x ~/.local/bin/memcore
 vendor/
 ├── wheels/                        # 二进制依赖（manylinux x86_64）
 │   ├── numpy-1.26.4-cp{39,310,311,312}-manylinux_2_17_x86_64.whl
-│   └── onnxruntime-1.16.3-cp{39,310,311} / 1.19.2-cp312-*.whl
+│   ├── onnxruntime-1.16.3-cp{39,310,311} / 1.19.2-cp312-*.whl
+│   └── 传递依赖（纯 Python）：coloredlogs / humanfriendly / flatbuffers
+│       / packaging / protobuf / sympy / mpmath
 └── models/
     └── bge-small-zh-v1.5/         # 本地向量模型（int8 ONNX，23.9 MB）
         ├── config.json
@@ -131,7 +133,10 @@ vendor/
         └── onnx/model_int8.onnx
 ```
 
-wheel 按 Python 版本自动匹配（cp39 / cp310 / cp311 / cp312 都有）。
+wheel 按 Python 版本自动匹配（cp39 / cp310 / cp311 / cp312 都有），
+onnxruntime 的传递依赖也一并收录，保证 `--no-index` 离线安装不会缺包。
+
+依赖闭包完整性由测试自动校验：`tests/test_memcore.py::TestVendorBundle`。
 
 > 想换更大的向量模型（如 bge-base-zh-v1.5）？把模型目录放进 `vendor/models/`，
 > 然后 `memcore config set embed_model_path=<绝对路径>`，再 `memcore reembed` 重建向量。

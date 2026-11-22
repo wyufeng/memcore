@@ -27,10 +27,23 @@ MODELS = ROOT / "vendor" / "models" / "bge-small-zh-v1.5"
 UA = {"User-Agent": "Mozilla/5.0 (memcore vendor fetcher)"}
 
 # (包名, 版本, 需要覆盖的 python tag)
+#
+# onnxruntime 的传递依赖必须一起带上，否则离线 `pip install --no-index` 会失败：
+#   onnxruntime -> coloredlogs, flatbuffers, numpy, packaging, protobuf, sympy
+#   coloredlogs -> humanfriendly
+#   sympy       -> mpmath
 WHEEL_SPECS = [
     ("numpy", "1.26.4", ["cp39", "cp310", "cp311", "cp312"]),
     ("onnxruntime", "1.16.3", ["cp39", "cp310", "cp311"]),
     ("onnxruntime", "1.19.2", ["cp312"]),
+    # ---- 传递依赖（纯 Python，任意 cp tag 通用）----
+    ("coloredlogs", "15.0.1", ["py3", "none"]),
+    ("humanfriendly", "10.0", ["py3", "none"]),
+    ("flatbuffers", "24.3.25", ["py3", "none"]),
+    ("packaging", "24.0", ["py3", "none"]),
+    ("protobuf", "4.25.3", ["py3", "none"]),
+    ("sympy", "1.13.1", ["py3", "none"]),
+    ("mpmath", "1.3.0", ["py3", "none"]),
 ]
 
 MODEL_FILES = [
@@ -66,6 +79,11 @@ def fetch(url: str, dest: Path, retries: int = 4) -> None:
 
 
 def pypi_urls(pkg: str, version: str, tags: list) -> list:
+    """取指定包指定版本的 wheel 直链。
+
+    tags 里含 "none" 表示接受纯 Python wheel（py3-none-any），
+    这类 wheel 文件名里没有 linux 字样，不能按平台过滤。
+    """
     meta = json.loads(
         urllib.request.urlopen(f"https://pypi.org/pypi/{pkg}/{version}/json", timeout=60).read()
     )
@@ -74,10 +92,13 @@ def pypi_urls(pkg: str, version: str, tags: list) -> list:
         fn = u["filename"]
         if not fn.endswith(".whl"):
             continue
-        if "x86_64" not in fn or "linux" not in fn:
-            continue
-        if "musllinux" in fn:
-            continue
+        pure_python = "none-any" in fn
+        if not pure_python:
+            # 二进制 wheel 只收 linux x86_64
+            if "x86_64" not in fn or "linux" not in fn:
+                continue
+            if "musllinux" in fn:
+                continue
         if not any(t in fn for t in tags):
             continue
         out.append((fn, u["url"]))

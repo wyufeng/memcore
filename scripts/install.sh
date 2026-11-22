@@ -63,78 +63,80 @@ install_wheels() {
     WHEEL_DIR="$REPO_DIR/vendor/wheels"
     [ -d "$WHEEL_DIR" ] || { warn "vendor/wheels 不存在，跳过二进制依赖安装"; return 0; }
 
-    # 只挑与当前 Python 版本匹配的 wheel
-    SEL=$(ls "$WHEEL_DIR" 2>/dev/null | grep -- "-$PY_TAG-" || true)
+    # 只挑与当前 Python 版本匹配的二进制 wheel（cp39/cp310/...）+ 纯 Python wheel
+    SEL=$(ls "$WHEEL_DIR" 2>/dev/null | grep -E -- "-$PY_TAG-|none-any\.whl$" || true)
     if [ -z "$SEL" ]; then
         warn "vendor/wheels 中没有匹配 $PY_TAG 的 wheel，跳过二进制依赖安装"
         return 0
     fi
 
-    # numpy 是 onnxruntime 的硬依赖，先装 numpy
-    for pkg in numpy onnxruntime; do
-        CASE_SEL=$(echo "$SEL" | grep -i "^$pkg-" || true)
-        [ -n "$CASE_SEL" ] || { warn "未找到 $pkg wheel，跳过"; continue; }
-        FILE=$(echo "$CASE_SEL" | head -1)
-        SRC="$WHEEL_DIR/$FILE"
-
-        if "$PY" -m pip --version >/dev/null 2>&1; then
-            if "$PY" -m pip install --no-index --find-links "$WHEEL_DIR" \
-                   --target "$SITE_DIR" --upgrade "$pkg" >/dev/null 2>&1; then
-                log "已离线安装 $pkg（pip --no-index）"
-                continue
-            fi
-            warn "pip 离线安装 $pkg 失败，改为手动解压"
+    # 优先走 pip：一次装齐 onnxruntime 及其传递依赖
+    if "$PY" -m pip --version >/dev/null 2>&1; then
+        if "$PY" -m pip install --no-index --find-links "$WHEEL_DIR" \
+               --target "$SITE_DIR" --upgrade numpy onnxruntime >/dev/null 2>&1; then
+            log "已离线安装 numpy + onnxruntime（pip --no-index）"
         else
-            warn "未找到 pip，改为手动解压 $pkg"
+            warn "pip 离线安装失败，改为手动解压全部 wheel"
+            extract_wheels_manually
         fi
-
-        # 手动解压 wheel（zip 结构，.data/ 里的内容也要处理）
-        TMP=$(mktemp -d)
-        if "$PY" - "$SRC" "$TMP" <<'PYEOF'
-import os, sys, zipfile
-wheel, dest = sys.argv[1], sys.argv[2]
-with zipfile.ZipFile(wheel) as z:
-    z.extractall(dest)
-# wheel 里 <pkg>-<ver>.data/ 下的内容并入目标
-data = None
-for d in os.listdir(dest):
-    if d.endswith(".data"):
-        data = os.path.join(dest, d)
-        break
-if data:
-    for sub in os.listdir(data):
-        src = os.path.join(data, sub)
-        if os.path.isdir(src):
-            for item in os.listdir(src):
-                s = os.path.join(src, item)
-                t = os.path.join(dest, item)
-                if os.path.isdir(s):
-                    os.makedirs(t, exist_ok=True)
-                    for f in os.listdir(s):
-                        shutil_move = os.path.join(s, f)
-                        with open(shutil_move, "rb") as fi, open(os.path.join(t, f), "wb") as fo:
-                            fo.write(fi.read())
-                else:
-                    with open(s, "rb") as fi, open(t, "wb") as fo:
-                        fo.write(fi.read())
-print("ok")
-PYEOF
-        then
-            mkdir -p "$SITE_DIR"
-            cp -R "$TMP"/* "$SITE_DIR"/ 2>/dev/null || true
-            rm -rf "$TMP"
-            log "已离线安装 $pkg（手动解压）"
-        else
-            rm -rf "$TMP"
-            warn "$pkg 手动解压失败"
-        fi
-    done
+    else
+        warn "未找到 pip，改为手动解压全部 wheel"
+        extract_wheels_manually
+    fi
 
     # 验证 numpy / onnxruntime 能否导入
     if PYTHONPATH="$SITE_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY" -c 'import numpy, onnxruntime' 2>/dev/null; then
         log "numpy + onnxruntime: 可用（本地向量模型就绪）"
     else
         warn "numpy / onnxruntime 不可用，向量化将退回内置哈希向量"
+    fi
+}
+
+# 兜底：没有 pip 时手动解压所有匹配的 wheel（含传递依赖）
+extract_wheels_manually() {
+    TMP=$(mktemp -d)
+    if "$PY" - "$WHEEL_DIR" "$TMP" "$SEL" <<'PYEOF'
+import os, sys, zipfile
+wheels_dir, dest = sys.argv[1], sys.argv[2]
+names = sys.argv[3].split()
+for name in names:
+    if not name:
+        continue
+    path = os.path.join(wheels_dir, name)
+    if not os.path.isfile(path):
+        continue
+    with zipfile.ZipFile(path) as z:
+        z.extractall(dest)
+    # wheel 里 <pkg>-<ver>.data/ 下的内容并入目标
+    for d in os.listdir(dest):
+        if not d.endswith(".data"):
+            continue
+        data = os.path.join(dest, d)
+        for sub in os.listdir(data):
+            src = os.path.join(data, sub)
+            if os.path.isdir(src):
+                for item in os.listdir(src):
+                    s = os.path.join(src, item)
+                    t = os.path.join(dest, item)
+                    if os.path.isdir(s):
+                        os.makedirs(t, exist_ok=True)
+                        for f in os.listdir(s):
+                            with open(os.path.join(s, f), "rb") as fi, \
+                                 open(os.path.join(t, f), "wb") as fo:
+                                fo.write(fi.read())
+                    else:
+                        with open(s, "rb") as fi, open(t, "wb") as fo:
+                            fo.write(fi.read())
+print("ok")
+PYEOF
+    then
+        mkdir -p "$SITE_DIR"
+        cp -R "$TMP"/* "$SITE_DIR"/ 2>/dev/null || true
+        rm -rf "$TMP"
+        log "已离线安装 numpy + onnxruntime（手动解压）"
+    else
+        rm -rf "$TMP"
+        warn "手动解压失败"
     fi
 }
 
