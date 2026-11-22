@@ -164,6 +164,7 @@ memcore decay                            # 按衰减强度归档冷记忆
 memcore reembed                          # 切换向量模型后重建全部向量
 memcore doctor                           # 环境自检
 memcore doctor --probe                   # 额外真实调用一次抽取模型，验证端点可用
+memcore doctor --mem                     # 内存体检：系统内存/swap/模型占用与 OOM 风险
 
 memcore config show                      # 查看全部配置
 memcore config keys                      # 列出可配置项
@@ -309,6 +310,39 @@ export MEMCORE_EXTRACT_API_KEY="sk-xxx"
 **降级是可见的**：`memcore distill` 会打印实际抽取来源，抽取模型未生效时附带具体失败原因
 （连接失败 / HTTP 错误码 / 响应结构无法识别 / 非 JSON 数组 / 缺少可用字段）；
 `memcore doctor --probe` 可主动探活端点。
+
+### 内存占用与 OOM 风险
+
+在 1~2GB 的小内存机器上（常见于轻量云主机），宿主进程 + memcore + 其它常驻服务
+加起来很容易把系统压到内存压力状态，表现是整机假死、SSH 无响应，而不是被 OOM killer 杀掉。
+
+`memcore doctor --mem` 直接把账算清楚：
+
+```
+  系统内存    : 总 1613MB / 已用 831MB / 可用 782MB
+  swap        : 总 2048MB / 已用 0MB
+  memcore 进程: RSS 102MB
+  本地向量模型: 加载后进程 RSS 148MB（模型自身约 +47MB，dim=512）
+  ⚠ 风险      : 机器总内存仅 1613MB，宿主 + memcore + 其它服务易触发内存压力；
+                建议 embed_threads=1，并停用重复的嵌入服务
+```
+
+实测参考值（bge-small-zh-v1.5 int8，512 维）：
+
+| 项目 | 占用 |
+|---|---|
+| onnxruntime 导入 | ~33MB |
+| 模型权重加载 | ~36MB |
+| 推理 arena（首次推理后） | ~25MB |
+| **本地向量模型合计** | **~115MB** |
+| memcore 进程整体（`context` 召回） | ~102MB |
+
+`embed_threads` 从 2 提到 4，内存几乎不变（+2MB），但单条推理快约 40%（46ms → 17ms）；
+在 1GB 机器上改成 1 可以省下线程池开销，代价是慢一倍。
+
+> 定位内存黑洞的通用手法：`journalctl -k -b -1 | grep -i "memory pressure"`。
+> 反复出现 `Under memory pressure, flushing caches` 但**没有** OOM kill 记录，
+> 说明是被内存压力拖死而非被 killer 杀掉，此时内存账要一个一个算，不要猜。
 
 自定义提示词（可选，支持 `{text}` 占位）：
 

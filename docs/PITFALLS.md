@@ -256,6 +256,55 @@ memcore reembed
 
 ---
 
+## 17. 小内存机器上「整机假死」不是 OOM，是内存压力
+
+**症状**：在 1.6GB 内存的云主机上跑 opencode，界面一直转圈打不开，
+SSH 也连不上，只能去控制台重启。重启后 `dmesg` 里**找不到任何 OOM kill 记录**。
+
+**原因**：先入为主以为"OOM 了"，其实内核没有杀任何进程。
+真正的证据在 journal 里：
+
+```bash
+journalctl -k -b -1 | grep -i "memory pressure"
+# Nov 22 17:46:56 systemd-journald: Under memory pressure, flushing caches.
+# Nov 22 17:55:27 systemd-journald: Under memory pressure, flushing caches.
+# ... 反复 15 分钟 ...
+```
+
+`Under memory pressure, flushing caches` 反复出现但**没有** `Out of memory: Killed process`，
+说明是内存紧张导致的持续回收与换页，把系统拖到假死，而不是被 killer 干掉。
+
+**解法**：把内存账逐项算清楚，不要猜。`memcore doctor --mem` 会输出：
+系统内存/swap、memcore 进程 RSS、本地向量模型加载后的增量，并在小内存机器上给出风险提示。
+
+阿里云那台机器的实际账：
+
+| 进程 | RSS |
+|---|---|
+| opencode 本体（bun） | ~420MB |
+| mem0 embed_server（fastembed，另一个重复的嵌入服务） | ~263MB |
+| mem0_api | ~155MB |
+| memcore（含本地模型） | ~102MB |
+| memos / smbd / syncthing / v2ray / frps / tailscaled 等 | ~150MB |
+| **合计** | **~1.3GB / 1.6GB** |
+
+**结论**：本地向量模型（~115MB）**不是**元凶，opencode 本体（~420MB）才是。
+memcore 在小内存机器上的建议：
+
+1. `memcore config set embed_threads=1`（线程池在 1GB 机器上是纯浪费）
+2. 停掉与 memcore 功能重复的嵌入服务（例如旧的 mem0 embed_server），一个模型只加载一份
+3. 抽取引用远程模型，别在本机跑 7B
+4. 配 swap（阿里云那台已有 2GB，但没有 swap 缓冲的话内存耗尽会直接触发 OOM kill）
+
+**判断口径**：`journalctl -k -b -1 | grep -iE "oom|killed process"` 空 + 有 memory pressure
+→ 内存压力假死；有 `Killed process` → 真的 OOM。两者处理方式不同。
+
+**顺带的坑**：本机 `git push` 到 GitHub 经常 `schannel: server closed abruptly`，
+但同一时刻云服务器上 push 却秒成功。跨网络环境推送失败时，换一台机器中转即可
+（服务器上已有 GitHub ssh key，用 `git@github.com:` 而非 `https://` remote）。
+
+---
+
 ## 附：真机验证清单
 
 在 Linux 目标机上跑完这几项才算真的可用：
@@ -293,6 +342,7 @@ Python 3.12.3 / pip 24.0，Node v22.22.2，SQLite FTS5 可用，用户 `admin`�
 | `memcore distill`（Ollama 裸地址 11434） | 自动走 `/api/chat` ✓ |
 | 端点不可达 | 回落规则抽取并打印具体失败原因 ✓ |
 | `memcore doctor --probe` | 可用（返回 N 条）/ 不可用（连接失败…）✓ |
+| `memcore doctor --mem` | 系统内存 1613MB / swap 2048MB / 进程 RSS 102MB / 模型 +47MB ✓ |
 | MCP stdio | initialize + tools/list（8 工具）+ remember + recall 全通 ✓ |
 | `memcore reembed` | 12 条向量重建，failed=0 ✓ |
 | **断网验证**（iptables DROP outbound） | doctor / 语义检索 / 写入 / 81 项单测全部正常 ✓ |
