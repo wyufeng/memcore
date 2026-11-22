@@ -163,6 +163,7 @@ memcore stats
 memcore decay                            # 按衰减强度归档冷记忆
 memcore reembed                          # 切换向量模型后重建全部向量
 memcore doctor                           # 环境自检
+memcore doctor --probe                   # 额外真实调用一次抽取模型，验证端点可用
 
 memcore config show                      # 查看全部配置
 memcore config keys                      # 列出可配置项
@@ -305,6 +306,9 @@ export MEMCORE_EXTRACT_API_KEY="sk-xxx"
 ```
 
 抽取模型不可用时自动退回本地规则抽取，不会中断使用。
+**降级是可见的**：`memcore distill` 会打印实际抽取来源，抽取模型未生效时附带具体失败原因
+（连接失败 / HTTP 错误码 / 响应结构无法识别 / 非 JSON 数组 / 缺少可用字段）；
+`memcore doctor --probe` 可主动探活端点。
 
 自定义提示词（可选，支持 `{text}` 占位）：
 

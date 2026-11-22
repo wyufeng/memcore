@@ -277,3 +277,45 @@ node /tmp/plugtest.mjs                       # 插件注入是否进 system prom
 ```bash
 pip install --no-index --find-links vendor/wheels numpy onnxruntime   # 应成功
 ```
+
+## 附：阿里云真机验证记录（2026-11-22）
+
+环境：阿里云 ECS `iZmj74r36wepz86fua14h0Z`，Ubuntu 24.04.4 LTS，x86_64，
+Python 3.12.3 / pip 24.0，Node v22.22.2，SQLite FTS5 可用，用户 `admin`（免 sudo）。
+
+| 项 | 结果 |
+|---|---|
+| `git clone --depth 1` | 6 秒，211 MB，vendor 完整 |
+| `sh scripts/install.sh` | 全程无网络请求，numpy+onnxruntime 离线装成功 |
+| 本地向量模型 | `bge-small-zh-v1.5` dim=512 size=22.8MB，`embedder: local-onnx` |
+| 语义召回 | "每天几点做数据备份"（无关键词）→ 正确命中备份记忆 |
+| `memcore distill`（OpenAI 兼容） | content 字段 ✓ / text 字段 ✓（容错） |
+| `memcore distill`（Ollama 裸地址 11434） | 自动走 `/api/chat` ✓ |
+| 端点不可达 | 回落规则抽取并打印具体失败原因 ✓ |
+| `memcore doctor --probe` | 可用（返回 N 条）/ 不可用（连接失败…）✓ |
+| MCP stdio | initialize + tools/list（8 工具）+ remember + recall 全通 ✓ |
+| `memcore reembed` | 12 条向量重建，failed=0 ✓ |
+| **断网验证**（iptables DROP outbound） | doctor / 语义检索 / 写入 / 81 项单测全部正常 ✓ |
+
+### 本次真机联调发现并修复的缺陷
+
+1. **抽取失败静默降级**（最严重）
+   配了抽取模型，若响应条目字段名不是 `content`（很多模型输出 `text`），
+   所有条目被丢弃 → 静默回落到规则抽取。用户看不出抽取模型压根没生效。
+   修复：`LAST_LLM_ERROR` 记录分类失败原因（连接失败 / HTTP 错误码 / 结构无法识别 /
+   非 JSON 数组 / 缺可用字段），`LAST_SOURCE` 记录实际来源，
+   CLI 直接打印来源与失败原因，`doctor --probe` 可主动探活。
+
+2. **响应结构兼容面窄**
+   原先只认 `choices[0].message.content` 与 `message.content`。
+   现补 `response` 字段（llama.cpp server 原生），并兼容条目字段名
+   `content/text/memory/fact/item/value`（含嵌套 dict）、`kind/type`、`importance/score`。
+
+3. **浅克隆导致 `git pull` 分叉**
+   `--depth 1` clone 后直接 `git pull` 会报 `Need to specify how to reconcile divergent branches`，
+   导致新代码没装上却误以为测的是新版。
+   验证前应确认 `git log --oneline -1` 是目标 commit，否则重新 clone。
+
+4. **系统 Python 的 numpy 版本冲突**
+   靶机系统已装 numpy 2.4.4，`--target` 装到用户级 site-packages 后不影响系统包，
+   但要确认 `PYTHONPATH` 顺序正确，否则可能加载到系统 numpy。
