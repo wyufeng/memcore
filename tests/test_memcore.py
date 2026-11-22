@@ -1047,5 +1047,87 @@ class TestMemReport(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestConfigPersistence(unittest.TestCase):
+    """配置项必须能真正落盘。"""
+
+    def _cfg(self, tmp: str) -> Config:
+        cfg = Config()
+        cfg.home = Path(tmp) / "home"
+        cfg.db_path = Path(tmp) / "memories.db"
+        cfg.config_path = Path(tmp) / "config.json"
+        cfg.ensure_dirs()
+        return cfg
+
+    def test_all_settable_keys_roundtrip(self):
+        """CONFIG_KEYS 里每个非密钥项，set 之后必须能从配置文件读回来。"""
+        from memcore import cli
+
+        tmp = tempfile.mkdtemp()
+        try:
+            cfg = self._cfg(tmp)
+            secret_keys = ("llm_api_key", "embed_api_key", "extract_api_key")
+            for key, caster in cli.CONFIG_KEYS.items():
+                if key in secret_keys:
+                    continue
+                if caster is bool:
+                    value = True
+                elif caster is int:
+                    value = 7
+                elif caster is float:
+                    value = 0.5
+                else:
+                    value = "probe-value"
+                setattr(cfg, key, value)
+            cfg.save()
+
+            saved = json.loads(Path(cfg.config_path).read_text(encoding="utf-8"))
+            for key, caster in cli.CONFIG_KEYS.items():
+                if key in secret_keys:
+                    continue
+                self.assertIn(key, saved, f"{key} 设置后没有写入配置文件")
+                self.assertEqual(saved[key], getattr(cfg, key), f"{key} 落盘值不一致")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_embed_threads_persists(self):
+        """回归：embed_threads 曾在 save() 白名单里漏写，导致 set 后不生效。"""
+        tmp = tempfile.mkdtemp()
+        try:
+            cfg = self._cfg(tmp)
+            cfg.embed_threads = 1
+            cfg.save()
+            saved = json.loads(Path(cfg.config_path).read_text(encoding="utf-8"))
+            self.assertEqual(saved.get("embed_threads"), 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_secrets_not_written_to_disk(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            cfg = self._cfg(tmp)
+            cfg.llm_api_key = "sk-secret"
+            cfg.embed_api_key = "sk-secret2"
+            cfg.extract_api_key = "sk-secret3"
+            cfg.save()
+            raw = Path(cfg.config_path).read_text(encoding="utf-8")
+            self.assertNotIn("sk-secret", raw)
+            self.assertNotIn("sk-secret2", raw)
+            self.assertNotIn("sk-secret3", raw)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_saved_json_is_valid_and_paths_are_strings(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            cfg = self._cfg(tmp)
+            cfg.save()
+            saved = json.loads(Path(cfg.config_path).read_text(encoding="utf-8"))
+            self.assertIsInstance(saved["home"], str)
+            self.assertIsInstance(saved["db_path"], str)
+            self.assertNotIn("config_path", saved)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

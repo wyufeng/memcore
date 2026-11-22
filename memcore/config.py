@@ -137,33 +137,15 @@ class Config:
 
     def save(self) -> None:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "home": str(self.home),
-            "db_path": str(self.db_path),
-            "llm_base_url": self.llm_base_url,
-            "llm_model": self.llm_model,
-            "use_llm": self.use_llm,
-            "extract_base_url": self.extract_base_url,
-            "extract_model": self.extract_model,
-            "extract_temperature": self.extract_temperature,
-            "extract_timeout": self.extract_timeout,
-            "extract_max_items": self.extract_max_items,
-            "extract_prompt_file": self.extract_prompt_file,
-            "embed_provider": self.embed_provider,
-            "embed_model_path": self.embed_model_path,
-            "embed_max_len": self.embed_max_len,
-            "embed_query_prefix": self.embed_query_prefix,
-            "embed_base_url": self.embed_base_url,
-            "embed_model": self.embed_model,
-            "embed_dim": self.embed_dim,
-            "w_lexical": self.w_lexical,
-            "w_vector": self.w_vector,
-            "w_importance": self.w_importance,
-            "w_recency": self.w_recency,
-            "recency_halflife_days": self.recency_halflife_days,
-            "recall_limit": self.recall_limit,
-            "decay_halflife_days": self.decay_halflife_days,
-        }
+        # 自动派生 payload，避免手写白名单漏项
+        # （历史上 embed_threads 就因为漏写在 save() 里，config set 之后不落盘）
+        payload = asdict(self)
+        payload["home"] = str(self.home)
+        payload["db_path"] = str(self.db_path)
+        payload.pop("config_path", None)
+        # 不把密钥写进明文配置
+        for k in ("llm_api_key", "embed_api_key", "extract_api_key"):
+            payload.pop(k, None)
         self.config_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
